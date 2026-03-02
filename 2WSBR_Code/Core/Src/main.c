@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,9 +31,21 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// MPU6050 I2C address (0x68 shifted left by 1 bit for HAL)
+#define MPU6050_ADDR (0x68 << 1)
 
+// MPU6050 Registers
+#define WHO_AM_I_REG 0x75
+#define PWR_MGMT_1_REG 0x6B
+#define ACCEL_XOUT_H_REG 0x3B
+
+// Filter Constants
+#define ALPHA 0.98f
+#define DT 0.005f               // 200Hz loop
+#define RAD_TO_DEG 57.29577951f
+#define ACCEL_SCALE 16384.0f
+#define GYRO_SCALE 131.0f
 /* USER CODE END PD */
-
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 
@@ -43,7 +55,10 @@
 I2C_HandleTypeDef hi2c1;
 
 /* USER CODE BEGIN PV */
-
+uint8_t rx_data[14]; // Buffer to hold the 14 bytes of raw I2C data
+int16_t raw_acc_x, raw_acc_y, raw_acc_z;
+int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
+float estimated_pitch = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,7 +71,41 @@ static void MX_I2C1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void MPU6050_Init(void) {
+    uint8_t check, data;
 
+    // Check if the sensor is responding
+    HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, WHO_AM_I_REG, 1, &check, 1, 1000);
+
+    if (check == 0x68) {  // 0x68 is the default WHO_AM_I value
+        // Wake up the sensor (it starts in sleep mode)
+        data = 0;
+        HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, PWR_MGMT_1_REG, 1, &data, 1, 1000);
+    }
+}
+
+void MPU6050_Read(void) {
+    // Read 14 bytes starting from the first Accelerometer register
+    HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H_REG, 1, rx_data, 14, 1000);
+
+    // Combine the High and Low bytes for each axis
+    raw_acc_x = (int16_t)(rx_data[0] << 8 | rx_data[1]);
+    raw_acc_y = (int16_t)(rx_data[2] << 8 | rx_data[3]);
+    raw_acc_z = (int16_t)(rx_data[4] << 8 | rx_data[5]);
+
+    // Skip temperature data in rx_data[6] and rx_data[7]
+
+    raw_gyro_x = (int16_t)(rx_data[8] << 8 | rx_data[9]);
+    raw_gyro_y = (int16_t)(rx_data[10] << 8 | rx_data[11]);
+    raw_gyro_z = (int16_t)(rx_data[12] << 8 | rx_data[13]);
+}
+
+float update_complementary_filter(int16_t acc_y, int16_t acc_z, int16_t gyro_x) {
+    float acc_pitch = atan2f((float)acc_y, (float)acc_z) * RAD_TO_DEG;
+    float gyro_rate = (float)gyro_x / GYRO_SCALE;
+    estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * DT) + (1.0f - ALPHA) * acc_pitch;
+    return estimated_pitch;
+}
 /* USER CODE END 0 */
 
 /**
@@ -90,18 +139,23 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+    MPU6050_Init();
+    /* USER CODE END 2 */
 
-  /* USER CODE END 2 */
+    /* Infinite loop */
+      /* USER CODE BEGIN WHILE */
+      while (1)
+      {
+        /* USER CODE END WHILE */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
+        /* USER CODE BEGIN 3 */
+        MPU6050_Read();
+        update_complementary_filter(raw_acc_y, raw_acc_z, raw_gyro_x);
 
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
+        // 5 millisecond delay creates our 200Hz loop time (DT = 0.005s)
+        HAL_Delay(5);
+      }
+      /* USER CODE END 3 */
 }
 
 /**
@@ -204,7 +258,7 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
