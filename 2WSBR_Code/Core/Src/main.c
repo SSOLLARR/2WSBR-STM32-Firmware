@@ -63,6 +63,16 @@ uint8_t rx_data[14]; // Buffer to hold the 14 bytes of raw I2C data
 int16_t raw_acc_x, raw_acc_y, raw_acc_z;
 int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
 float estimated_pitch = 0.0f;
+// PID Controller Variables
+float Kp = 1500.0f;  // Cranked up 10x so it actually spins fast!
+float Ki = 0.0f;    //
+float Kd = 15.0f;    //
+
+float target_angle = -3.6f; // The perfect balance point
+float pid_error = 0.0f;
+float previous_error = 0.0f;
+float pid_integral = 0.0f;
+float pid_output = 0.0f;   // This will become our motor speed
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -107,6 +117,69 @@ float update_complementary_filter(int16_t acc_y, int16_t acc_z, int16_t gyro_x) 
     float gyro_rate = (float)gyro_x / GYRO_SCALE;
     estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * DT) + (1.0f - ALPHA) * acc_pitch;
     return estimated_pitch;
+} //
+
+float calculate_PID(float current_pitch) {
+    // 1. Calculate how far off we are from perfect balance
+    pid_error = current_pitch - target_angle;
+
+    // 2. Proportional (P)
+    float P_out = Kp * pid_error;
+
+    // 3. Integral (I) - Accumulate the error over time
+    pid_integral += pid_error * DT;
+    // Prevent the integral from building up too much (windup)
+    if (pid_integral > 400.0f) pid_integral = 400.0f;
+    if (pid_integral < -400.0f) pid_integral = -400.0f;
+    float I_out = Ki * pid_integral;
+
+    // 4. Derivative (D) - How fast is the error changing?
+    float derivative = (pid_error - previous_error) / DT;
+    float D_out = Kd * derivative;
+
+    // 5. Add them all together to get the final motor speed
+    pid_output = P_out + I_out + D_out;
+
+    // Save current error for the next loop
+    previous_error = pid_error;
+
+    return pid_output;
+}
+
+void set_motor_speed(float speed) {
+    // 1. Check which way we are falling and set Direction pins
+    if (speed > 0) {
+        // Falling forward -> Drive forward to catch it
+        HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
+    } else {
+        // Falling backward -> Drive backward to catch it
+        HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_SET);
+
+        speed = -speed; // Make the speed number positive for the timer math
+    }
+
+    // 2. Deadband & 16-bit Safety: Prevent timer overflow and silence motors when balanced
+        if (speed < 20.0f) {
+            htim1.Instance->CCR1 = 0; // 0% duty cycle (OFF)
+            htim4.Instance->CCR1 = 0;
+            return;
+        }
+
+    // 3. Speed Limit: Don't let the PID ask for impossible speeds
+    if (speed > 4000.0f) speed = 4000.0f; // Max 4000 steps per second
+
+    // 4. Timer Math: Convert requested speed into hardware timer ticks
+    // Since our timer runs at 1,000,000 ticks per second (1MHz):
+    uint32_t timer_arr = (uint32_t)(1000000.0f / speed) - 1;
+
+    // 5. Inject the new speed directly into the hardware registers
+    htim1.Instance->ARR = timer_arr;
+    htim1.Instance->CCR1 = timer_arr / 2; // Keep it a perfect 50% square wave
+
+    htim4.Instance->ARR = timer_arr;
+    htim4.Instance->CCR1 = timer_arr / 2;
 }
 /* USER CODE END 0 */
 
@@ -157,7 +230,8 @@ int main(void)
       // 3. Start the Step Pulses!
       HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Left Motor
       HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1); // Right Motor
-    /* USER CODE END 2 */
+  /* USER CODE END 2 */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
       while (1)
@@ -165,12 +239,14 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-        MPU6050_Read();
-        update_complementary_filter(raw_acc_y, raw_acc_z, raw_gyro_x);
+    	       MPU6050_Read();
+    	      update_complementary_filter(raw_acc_y, raw_acc_z, raw_gyro_x);
 
-        // 5 millisecond delay creates our 200Hz loop time (DT = 0.005s)
-        HAL_Delay(5);
-      }
+    	      float out = calculate_PID(estimated_pitch);
+    	      set_motor_speed(out);   // <-- THIS WAS MISSING
+
+    	      HAL_Delay(5);
+    	        }
   /* USER CODE END 3 */
 }
 
