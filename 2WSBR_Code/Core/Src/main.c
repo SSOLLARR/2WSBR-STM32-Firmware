@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,7 +41,7 @@
 #define ACCEL_XOUT_H_REG 0x3B
 
 // Filter Constants
-#define ALPHA 0.98f
+#define ALPHA 0.97f
 #define DT 0.005f               // 200Hz loop
 #define RAD_TO_DEG 57.29577951f
 #define ACCEL_SCALE 16384.0f
@@ -58,19 +59,25 @@ I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim4;
 
+UART_HandleTypeDef huart2;
+
 /* USER CODE BEGIN PV */
 uint8_t rx_data[14]; // Buffer to hold the 14 bytes of raw I2C data
 int16_t raw_acc_x, raw_acc_y, raw_acc_z;
 int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
 float estimated_pitch = 0.0f;
 // PID Controller Variables
-float Kp = 1500.0f;  // Cranked up 10x so it actually spins fast!
+float Kp = 1500.0f;  //
 float Ki = 0.0f;    //
-float Kd = 15.0f;    //
+float Kd = 50.0f;    //
 
-float target_angle = -3.6f; // The perfect balance point
+// Motor Acceleration Profile Variables
+float current_speed = 0.0f;  // The actual speed currently sent to the timers
+
+
+float target_angle = 3.2f; // The perfect balance point
 float pid_error = 0.0f;
-float previous_error = 0.0f;
+float previous_error = 5.0f;
 float pid_integral = 0.0f;
 float pid_output = 0.0f;   // This will become our motor speed
 /* USER CODE END PV */
@@ -81,6 +88,7 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM4_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -88,9 +96,9 @@ static void MX_TIM4_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 void MPU6050_Init(void) {
-    uint8_t data = 0x00; // 0x00 means "Clear Sleep Mode"
+    uint8_t data = 0x00;
 
-    // Force the sensor to wake up, no questions asked
+    // Sensor wake up
     HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, PWR_MGMT_1_REG, 1, &data, 1, 1000);
 }
 
@@ -112,71 +120,63 @@ void MPU6050_Read(void) {
     raw_gyro_z = (int16_t)(rx_data[12] << 8 | rx_data[13]);
 }
 
-float update_complementary_filter(int16_t acc_y, int16_t acc_z, int16_t gyro_x) {
-    float acc_pitch = atan2f((float)acc_y, (float)acc_z) * RAD_TO_DEG;
-    float gyro_rate = (float)gyro_x / GYRO_SCALE;
+float update_complementary_filter(float acc_pitch, float gyro_rate) {
+    // No more hidden math here. Just the pure filter logic.
     estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * DT) + (1.0f - ALPHA) * acc_pitch;
     return estimated_pitch;
-} //
+}
 
-float calculate_PID(float current_pitch) {
-    // 1. Calculate how far off we are from perfect balance
+float calculate_PID(float current_pitch, float gyro_rate) {
     pid_error = current_pitch - target_angle;
-
-    // 2. Proportional (P)
     float P_out = Kp * pid_error;
 
-    // 3. Integral (I) - Accumulate the error over time
     pid_integral += pid_error * DT;
-    // Prevent the integral from building up too much (windup)
     if (pid_integral > 400.0f) pid_integral = 400.0f;
     if (pid_integral < -400.0f) pid_integral = -400.0f;
     float I_out = Ki * pid_integral;
 
-    // 4. Derivative (D) - How fast is the error changing?
-    float derivative = (pid_error - previous_error) / DT;
-    float D_out = Kd * derivative;
+    // Use the passed-in gyro_rate directly! No hidden math.
+    float D_out = Kd * gyro_rate;
 
-    // 5. Add them all together to get the final motor speed
     pid_output = P_out + I_out + D_out;
-
-    // Save current error for the next loop
-    previous_error = pid_error;
-
     return pid_output;
 }
 
-void set_motor_speed(float speed) {
-    // 1. Check which way we are falling and set Direction pins
-    if (speed > 0) {
-        // Falling forward -> Drive forward to catch it
-        HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
-    } else {
-        // Falling backward -> Drive backward to catch it
+void set_motor_speed(float target_speed) {
+
+    // 1. Let the PID take 100% control. No artificial ramps.
+    float applied_speed = target_speed;
+
+    // 2. Check Direction using the raw PID output
+    if (applied_speed > 0) {
+        // Forward
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_SET);
+    } else {
+        // Backward
+        HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
 
-        speed = -speed; // Make the speed number positive for the timer math
+        applied_speed = -applied_speed; // Flip to positive for timer math
     }
 
-    // 2. Deadband & 16-bit Safety: Prevent timer overflow and silence motors when balanced
-        if (speed < 20.0f) {
-            htim1.Instance->CCR1 = 0; // 0% duty cycle (OFF)
-            htim4.Instance->CCR1 = 0;
-            return;
-        }
+    // 3. Deadband: Prevent 16-bit timer overflow and micro-jitters
+    if (applied_speed < 20.0f) {
+        htim1.Instance->CCR1 = 0;
+        htim4.Instance->CCR1 = 0;
+        return;
+    }
 
-    // 3. Speed Limit: Don't let the PID ask for impossible speeds
-    if (speed > 4000.0f) speed = 4000.0f; // Max 4000 steps per second
+    // 4. Hard Speed Limit: Prevent asking the motors to do the physically impossible
+    if (applied_speed > 20000.0f) {
+        applied_speed = 20000.0f;
+    }
 
-    // 4. Timer Math: Convert requested speed into hardware timer ticks
-    // Since our timer runs at 1,000,000 ticks per second (1MHz):
-    uint32_t timer_arr = (uint32_t)(1000000.0f / speed) - 1;
+    // 5. Timer Math: Inject the raw speed into the hardware
+    uint32_t timer_arr = (uint32_t)(1000000.0f / applied_speed) - 1;
 
-    // 5. Inject the new speed directly into the hardware registers
     htim1.Instance->ARR = timer_arr;
-    htim1.Instance->CCR1 = timer_arr / 2; // Keep it a perfect 50% square wave
+    htim1.Instance->CCR1 = timer_arr / 2;
 
     htim4.Instance->ARR = timer_arr;
     htim4.Instance->CCR1 = timer_arr / 2;
@@ -215,13 +215,14 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM1_Init();
   MX_TIM4_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
       HAL_Delay(100); // Let the clone IMU boot up
       MPU6050_Init();
 
       // 1. Set Directions (One HIGH, one LOW so they push the chassis the same way)
-      HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
 
       // 2. Turn ON the Motor Drivers (Active LOW)
       HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
@@ -234,19 +235,41 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-      while (1)
-      {
+            // 1. Add the timer variable right BEFORE the main while loop starts
+            uint32_t last_loop_time = HAL_GetTick();
+
+            while (1)
+            {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    	       MPU6050_Read();
-    	      update_complementary_filter(raw_acc_y, raw_acc_z, raw_gyro_x);
+                // 2. Only run the math if EXACTLY 5 milliseconds have passed
+                if (HAL_GetTick() - last_loop_time >= 5) {
+                    last_loop_time = HAL_GetTick(); // Reset the timer
 
-    	      float out = calculate_PID(estimated_pitch);
-    	      set_motor_speed(out);   // <-- THIS WAS MISSING
+                    MPU6050_Read();
+                    // 1. THE SINGLE SOURCE OF TRUTH (Calculate floats ONCE)
+                    float acc_pitch = atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG;
+			  float gyro_rate = (float)raw_gyro_x / GYRO_SCALE;
 
-    	      HAL_Delay(5);
-    	        }
+				  // 2. THE ALIGNMENT HACK (Kill the fighting sensors)
+			        // Your notes proved they are physically opposed. We invert the gyro here
+                                      // so that + means FORWARD for both sensors.
+			                          gyro_rate = -gyro_rate;
+                                      acc_pitch = -acc_pitch;
+                                      // 3. Feed the aligned variables to the Brain
+                                      update_complementary_filter(acc_pitch, gyro_rate);
+                                      calculate_PID(estimated_pitch, gyro_rate);
+                                      set_motor_speed(pid_output);
+
+                                      // 4. Feed the exact same aligned variables to MATLAB
+                                      char tx_buffer[80];
+                                      int len = sprintf(tx_buffer, "%.2f,%.2f,%.2f,%.2f\r\n", acc_pitch, gyro_rate, estimated_pitch, pid_output);
+
+                                      extern UART_HandleTypeDef huart2;
+                                      HAL_UART_Transmit(&huart2, (uint8_t*)tx_buffer, len, 5);
+                }
+            } // <-- This brace closes the while(1) loop!
   /* USER CODE END 3 */
 }
 
@@ -476,6 +499,54 @@ static void MX_TIM4_Init(void)
 
   /* USER CODE END TIM4_Init 2 */
   HAL_TIM_MspPostInit(&htim4);
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
 
 }
 

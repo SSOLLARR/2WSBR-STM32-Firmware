@@ -61,7 +61,7 @@ main-build: 2WSBR_Code.elf secondary-outputs
 
 # Tool invocations
 2WSBR_Code.elf 2WSBR_Code.map: $(OBJS) $(USER_OBJS) C:\Users\themb\uom\ eee\OneDrive\ -\ The\ University\ of\ Manchester\Desktop\School\Year\ 3\Project\2WSBR_Firmware\2WSBR-STM32-Firmware\2WSBR_Code\STM32G491RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "2WSBR_Code.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\themb\uom eee\OneDrive - The University of Manchester\Desktop\School\Year 3\Project\2WSBR_Firmware\2WSBR-STM32-Firmware\2WSBR_Code\STM32G491RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="2WSBR_Code.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+	arm-none-eabi-gcc -o "2WSBR_Code.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\themb\uom eee\OneDrive - The University of Manchester\Desktop\School\Year 3\Project\2WSBR_Firmware\2WSBR-STM32-Firmware\2WSBR_Code\STM32G491RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="2WSBR_Code.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
