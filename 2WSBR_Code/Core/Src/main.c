@@ -4,20 +4,16 @@
   * @file           : main.c
   * @brief          : Main program body
   ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "dma.h"
+#include "i2c.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -32,20 +28,20 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// MPU6050 I2C address (0x68 shifted left by 1 bit for HAL)
+/* MPU6050 Configuration */
 #define MPU6050_ADDR (0x68 << 1)
-//testing
-#define MODE_BALANCING 0
-#define MODE_STEP_RESPONSE 1
-#define MODE_SWEEP 2
-// MPU6050 Registers
 #define WHO_AM_I_REG 0x75
 #define PWR_MGMT_1_REG 0x6B
 #define ACCEL_XOUT_H_REG 0x3B
 
-// Filter Constants
+/* Operational Modes */
+#define MODE_BALANCING 0
+#define MODE_STEP_RESPONSE 1
+#define MODE_SWEEP 2
+
+/* Filter & Control Constants */
 #define ALPHA 0.97f
-#define DT 0.005f               // 200Hz loop
+#define DT 0.005f
 #define RAD_TO_DEG 57.29577951f
 #define ACCEL_SCALE 16384.0f
 #define GYRO_SCALE 131.0f
@@ -57,45 +53,41 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-I2C_HandleTypeDef hi2c1;
-
-TIM_HandleTypeDef htim1;
-TIM_HandleTypeDef htim4;
-
-UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-uint8_t rx_data[14]; // Buffer to hold the 14 bytes of raw I2C data
+/* Sensor Data Buffers */
+uint8_t rx_data[14];
 int16_t raw_acc_x, raw_acc_y, raw_acc_z;
 int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
 float estimated_pitch = 0.0f;
-// PID Controller Variables
-float Kp = 1600.0f;  //
-float Ki = 10.0f;    //
-float Kd = 60.0f;    //
 
-// Motor Acceleration Profile Variables
-float current_speed = 0.0f;  // The actual speed currently sent to the timers
+/* PID Parameters */
+float Kp = 100.0f;
+float Ki = 0.0f;
+float Kd = 100.0f;
 
-
-float target_angle = 3.51759481f; // The perfect balance point
+float target_angle = -1.35449028f;
 float pid_error = 0.0f;
 float previous_error = 5.0f;
 float pid_integral = 0.0f;
 float pid_output = 0.0f;
 
-int test_mode = MODE_BALANCING; // Change modes
+/* System States */
+float battery_voltage = 0.0f;
+float current_speed = 0.0f;
+int test_mode = MODE_BALANCING;
 uint32_t test_timer = 0;
 float test_speed = 0.0f;
+
+static volatile uint8_t uart_tx_busy = 0;
+uint16_t telemetry_counter = 0;
+uint16_t loop_exec_time_us = 0;
+uint16_t loop_period_us = 0;
+uint16_t last_loop_stamp_us = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
-static void MX_TIM1_Init(void);
-static void MX_TIM4_Init(void);
-static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -104,31 +96,37 @@ static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN 0 */
 void MPU6050_Init(void) {
     uint8_t data = 0x00;
-
-    // Sensor ON
     HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, PWR_MGMT_1_REG, 1, &data, 1, 1000);
 }
 
 HAL_StatusTypeDef i2c_status;
 
 void MPU6050_Read(void) {
-    // Read 14 bytes and save
-    i2c_status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H_REG, 1, rx_data, 14, 1000);
+    // 1. Attempt the read with a strict 2ms timeout
+    i2c_status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H_REG, 1, rx_data, 14, 2);
 
-    // Combine the High and Low bytes for each axis
-    raw_acc_x = (int16_t)(rx_data[0] << 8 | rx_data[1]);
-    raw_acc_y = (int16_t)(rx_data[2] << 8 | rx_data[3]);
-    raw_acc_z = (int16_t)(rx_data[4] << 8 | rx_data[5]);
+    // 2. CHECK THE RETURN STATUS
+    if (i2c_status == HAL_OK) {
+        // Success! We have fresh, valid data. Safe to parse.
+        raw_acc_x = (int16_t)(rx_data[0] << 8 | rx_data[1]);
+        raw_acc_y = (int16_t)(rx_data[2] << 8 | rx_data[3]);
+        raw_acc_z = (int16_t)(rx_data[4] << 8 | rx_data[5]);
 
-    // Skip temperature data in rx_data[6] and rx_data[7]
+        raw_gyro_x = (int16_t)(rx_data[8] << 8 | rx_data[9]);
+        raw_gyro_y = (int16_t)(rx_data[10] << 8 | rx_data[11]);
+        raw_gyro_z = (int16_t)(rx_data[12] << 8 | rx_data[13]);
+    }
+    else {
+        // FAILURE! The sensor disconnected, timed out, or glitched.
+        // Do NOT parse the data.
 
-    raw_gyro_x = (int16_t)(rx_data[8] << 8 | rx_data[9]);
-    raw_gyro_y = (int16_t)(rx_data[10] << 8 | rx_data[11]);
-    raw_gyro_z = (int16_t)(rx_data[12] << 8 | rx_data[13]);
+        // Safety feature: Kill the motors immediately so the robot
+        // doesn't run away blindly using old PID data.
+        htim1.Instance->CCR1 = 0;
+        htim4.Instance->CCR1 = 0;
+    }
 }
-
 float update_complementary_filter(float acc_pitch, float gyro_rate) {
-
     estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * DT) + (1.0f - ALPHA) * acc_pitch;
     return estimated_pitch;
 }
@@ -142,7 +140,6 @@ float calculate_PID(float current_pitch, float gyro_rate) {
     if (pid_integral < -400.0f) pid_integral = -400.0f;
     float I_out = Ki * pid_integral;
 
-
     float D_out = Kd * gyro_rate;
 
     pid_output = P_out + I_out + D_out;
@@ -150,40 +147,80 @@ float calculate_PID(float current_pitch, float gyro_rate) {
 }
 
 void set_motor_speed(float target_speed) {
-    float applied_speed = target_speed;
+    // 1. Trap NaN or Infinity before they hit the hardware
+    if (isnan(target_speed) || isinf(target_speed)) {
+        htim1.Instance->CCR1 = 0;
+        htim4.Instance->CCR1 = 0;
+        return;
+    }
+    // CLAMP TARGET HERE, BEFORE THE LIMITER
+        if (target_speed > 3000.0f) target_speed = 3000.0f;
+        if (target_speed < -3000.0f) target_speed = -3000.0f;
 
-    // 1. Direction Handling
+        // --- 2. THE ADVANCED SLEW RATE LIMITER ---
+            static float current_speed = 0.0f;
+
+            // TUNE THESE TWO VARIABLES:
+            float max_change_per_loop = 265.0f; // Push this as high as you can before stalling
+            float instant_kick_speed = 500.0f; // The speed the motor can instantly jump to from 0
+
+            // If the motor is currently stopped, allow an instant jump to the kick speed
+            if (current_speed == 0.0f && target_speed > instant_kick_speed) {
+                current_speed = instant_kick_speed;
+            }
+            else if (current_speed == 0.0f && target_speed < -instant_kick_speed) {
+                current_speed = -instant_kick_speed;
+            }
+            // Otherwise, apply the normal acceleration ramp
+            else {
+                if (target_speed > current_speed + max_change_per_loop) {
+                    current_speed += max_change_per_loop;
+                }
+                else if (target_speed < current_speed - max_change_per_loop) {
+                    current_speed -= max_change_per_loop;
+                }
+                else {
+                    current_speed = target_speed;
+                }
+            }
+
+    // Use the smoothed speed for the physical hardware logic
+    float applied_speed = current_speed;
+
+    // --- 3. HARDWARE UPDATES ---
+    /* Handle Direction States */
     if (applied_speed >= 0) {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_SET);
     } else {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
-        applied_speed = -applied_speed;
+        applied_speed = -applied_speed; // Make positive for timer math
     }
 
-    // 2. The "Deadzone"
-    // If speed is too low to move, hard-stop both to 0 to prevent humming
+    /* Enforce deadzone to prevent audible motor hum at zero speed */
     if (applied_speed < 20.0f) {
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
         return;
     }
 
-    // 3. Limit the Max (Prevent 16-bit overflow)
-    if (applied_speed > 20000.0f) applied_speed = 20000.0f;
+    /* Cap upper limit to prevent 16-bit timer overflow */
+    // Note: I kept your original logic, but jumping from 3000 to 20000
+    // is a massive leap! You might want to just clamp it to 3000.0f.
+    if (applied_speed > 3000.0f) applied_speed = 3000.0f;
 
-    // 4. Calculate ARR (Frequency)
-    // Use 1,000,000 because Prescaler is 169 (170Mhz / 170 = 1MHz clock)
+    /* Calculate timer Auto-Reload Register (ARR) for target frequency */
+    // Assuming your timer clock is 1MHz (170MHz / 170 prescaler)
     uint32_t timer_arr = (uint32_t)(1000000.0f / applied_speed) - 1;
 
-    // 5.Force the timers to change at the same moment
-    __disable_irq(); // Briefly stop interrupts so both registers update together
+    /* Synchronize dual timer updates */
+    __disable_irq();
     htim1.Instance->ARR = timer_arr;
-    htim1.Instance->CCR1 = timer_arr / 2; // 50% Duty Cycle
+    htim1.Instance->CCR1 = timer_arr / 2; // Keep 50% duty cycle
 
     htim4.Instance->ARR = timer_arr;
-    htim4.Instance->CCR1 = timer_arr / 2;
+    htim4.Instance->CCR1 = timer_arr / 2; // Keep 50% duty cycle
     __enable_irq();
 }
 /* USER CODE END 0 */
@@ -217,90 +254,155 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_TIM1_Init();
   MX_TIM4_Init();
   MX_USART2_UART_Init();
+  MX_ADC2_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
-      HAL_Delay(100); // Time for IMU to turn on
-      MPU6050_Init();
+    HAL_TIM_Base_Start(&htim6);
+  __HAL_TIM_SET_COUNTER(&htim6, 0);
+  last_loop_stamp_us = 0;
+        /* Hardware Initialization Delay */
+        HAL_Delay(100);
+        MPU6050_Init();
 
-      // 1. Set Directions
-      HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
-      HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
+        /* Initialize Motor Drivers */
+        HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
 
-      // 2. Turn ON the Motor Drivers (Active LOW)
-      HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
+        // --- THE FIX: ENABLE SHADOW REGISTERS ---
+        // This forces the timer to wait until the end of its current
+        // cycle before applying the new speed, preventing the 65k wrap-around stall.
+        htim1.Instance->CR1 |= TIM_CR1_ARPE;
+        htim4.Instance->CR1 |= TIM_CR1_ARPE;
 
-      // 3. Start the Step Pulses!
-      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Left Motor relative to stm usb view
-      HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1); // Right Motor
+        // --- THE FIX: PERFECT SYNCHRONIZATION ---
+        // Reset both counters to exactly zero before starting them,
+        // so their PWM waves are perfectly aligned in time.
+        htim1.Instance->CNT = 0;
+        htim4.Instance->CNT = 0;
+
+
+
+        /* Start PWM Channels */
+        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+        HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+
+        uint32_t last_loop_time = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-            // 1. Timer variable before
-            uint32_t last_loop_time = HAL_GetTick();
+        while (1) {
+        	uint16_t now = __HAL_TIM_GET_COUNTER(&htim6);
+        	uint16_t elapsed = (uint16_t)(now - last_loop_stamp_us);
 
-            while (1)
-            {
-                /* USER CODE BEGIN 3 */
-                if (HAL_GetTick() - last_loop_time >= 5) {
-                    last_loop_time = HAL_GetTick();
+        	if (elapsed >= 5000) {
+        	    loop_period_us = elapsed;
+        	    last_loop_stamp_us = now;
 
-                    // 1. Read Sensors (Helps monitor vibrations and its effect)
-                    MPU6050_Read();
-                    float acc_pitch = - (atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
-                    float gyro_rate = - ((float)raw_gyro_x / GYRO_SCALE);
-                    update_complementary_filter(acc_pitch, gyro_rate);
+        	    uint16_t exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
 
-                    // 2. Mode selection
-                    switch(test_mode) {
+                /* 1. ACQUIRE SENSOR DATA */
+                MPU6050_Read();
 
-                        case MODE_BALANCING:
-                            calculate_PID(estimated_pitch, gyro_rate);
-                            set_motor_speed(pid_output);
-                            break;
+                float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
+                float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE);
 
-                        case MODE_STEP_RESPONSE:
-                            /* TEST: Jump from 0 to 5000 speed after 2 seconds
-                               MATLAB: How fast does gyro_rate spike? */
-                            if (test_timer < 400) { // 400 loops * 5ms = 2 seconds
-                                test_speed = 0;
-                            } else if (test_timer < 600) { // Next 1 second
-                                test_speed = 5000.0f;
-                            } else {
-                                test_speed = 0;
-                                test_timer = 0; // Reset test
+                /* 2. SENSOR FUSION */
+                update_complementary_filter(acc_pitch, gyro_rate);
+
+                /* 3. EXECUTE CURRENT MODE */
+                switch (test_mode) {
+                    case MODE_BALANCING:
+                        calculate_PID(estimated_pitch, gyro_rate);
+                        set_motor_speed(pid_output);
+                        break;
+
+                    case MODE_STEP_RESPONSE:
+                        // This test ramps speed every 0.5 seconds to find the stall point.
+                        // Ensure the robot is on a stand (wheels off the ground) for the first run!
+
+                        test_timer++;
+
+                        if (test_timer < 100) {
+                            test_speed = 0;          // Start at zero
+                        }
+                        else if (test_timer < 1000) { // 4.5 second ramp test
+                            // Increment speed by 5 units every 5ms loop
+                            // Result: Speed increases by 1000 units per second
+                            test_speed += 5.0f;
+                        }
+                        else {
+                            test_speed = 0;
+                            test_timer = 0;          // Reset test
+                        }
+
+                        // Bypass the PID—send the test ramp directly to the motor logic
+                        set_motor_speed(test_speed);
+
+                        // Log test_speed as pid_output for the Telemetry graph
+                        pid_output = test_speed;
+                        break;
+
+                    case MODE_SWEEP:
+                    {
+                        static int sweep_direction = 1;
+                        float sweep_step = 2.0f;
+
+                        if (sweep_direction == 1) {
+                            test_speed += sweep_step;
+                            if (test_speed >= 3000.0f) {
+                                sweep_direction = -1;
                             }
-                            test_timer++;
-                            set_motor_speed(test_speed);
-                            pid_output = test_speed; // For MATLAB logging
-                            break;
+                        } else {
+                            test_speed -= sweep_step;
+                            if (test_speed <= 0.0f) {
+                                test_speed = 0.0f;
+                                sweep_direction = 1;
+                            }
+                        }
 
-                        case MODE_SWEEP:
-                            /* TEST: Slowly ramp speed to find resonance/stall points
-                               Watch for when the robot frame starts vibrating wildly */
-                            test_speed += 20.0f;
-                            if (test_speed > 15000.0f) test_speed = 0;
-                            set_motor_speed(test_speed);
-                            pid_output = test_speed;
-                            break;
+                        set_motor_speed(test_speed);
+                        pid_output = test_speed;
+                        break;
                     }
 
-                    // 3. Optimized Logging for MATLAB
-
-                    char tx_buffer[100];
-                    int len = sprintf(tx_buffer, "%lu,%.2f,%.2f,%.2f,%.2f\r\n",
-                                     last_loop_time, acc_pitch, gyro_rate, estimated_pitch, pid_output);
-
-
-
-                    HAL_UART_Transmit(&huart2, (uint8_t*)tx_buffer, len, 10);
+                    default:
+                        break;
                 }
-            }
-            /* USER CODE END 3 */
+
+                loop_exec_time_us = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim6) - exec_start_us);
+
+                // 1. Increase Baud Rate in CubeMX to 460800 or 921600
+                // 2. Optimization: Use a smaller buffer and shorter float precision
+
+                if (!uart_tx_busy) {
+                    static char tx_buffer[96];
+
+                    int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                                       "$%u,%u,%.3f,%.3f,%.3f,%.3f\n",
+                                       loop_period_us, loop_exec_time_us,
+                                       acc_pitch, gyro_rate, estimated_pitch, pid_output);
+
+                    if (len > 0) {
+                        HAL_StatusTypeDef tx_status =
+                            HAL_UART_Transmit_DMA(&huart2, (uint8_t *)tx_buffer, len);
+
+                        if (tx_status == HAL_OK) {
+                            uart_tx_busy = 1;
+                        } else {
+                            uart_tx_busy = 0;
+                        }
+                    }
+                }}
+        }
+  /* USER CODE END 3 */
 }
 
 /**
@@ -314,7 +416,7 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1);
+  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -322,7 +424,13 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLN = 85;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -332,297 +440,24 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
     Error_Handler();
   }
-}
-
-/**
-  * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2C1_Init(void)
-{
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00503D58;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Analogue filter
-  */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Digital filter
-  */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
-}
-
-/**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 169;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 999;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 500;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.BreakFilter = 0;
-  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
-  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
-  sBreakDeadTimeConfig.Break2Filter = 0;
-  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
-
-}
-
-/**
-  * @brief TIM4 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM4_Init(void)
-{
-
-  /* USER CODE BEGIN TIM4_Init 0 */
-
-  /* USER CODE END TIM4_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
-  /* USER CODE BEGIN TIM4_Init 1 */
-
-  /* USER CODE END TIM4_Init 1 */
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 169;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 999;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 500;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM4_Init 2 */
-
-  /* USER CODE END TIM4_Init 2 */
-  HAL_TIM_MspPostInit(&htim4);
-
-}
-
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, EN_L_Pin|DIR_L_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, EN_R_Pin|DIR_R_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : EN_L_Pin DIR_L_Pin */
-  GPIO_InitStruct.Pin = EN_L_Pin|DIR_L_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : EN_R_Pin DIR_R_Pin */
-  GPIO_InitStruct.Pin = EN_R_Pin|DIR_R_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        uart_tx_busy = 0;
+    }
+}
 /* USER CODE END 4 */
 
 /**
