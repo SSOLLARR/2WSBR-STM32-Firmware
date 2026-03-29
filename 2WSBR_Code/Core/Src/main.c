@@ -45,6 +45,7 @@
 #define RAD_TO_DEG 57.29577951f
 #define ACCEL_SCALE 16384.0f
 #define GYRO_SCALE 131.0f
+#define DIVIDER_RATIO 6.0f  // Adjust this based on your actual resistor values
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -293,7 +294,7 @@ int main(void)
         HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
         HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
 
-        uint32_t last_loop_time = HAL_GetTick();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -307,7 +308,16 @@ int main(void)
         	    last_loop_stamp_us = now;
 
         	    uint16_t exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
+        	    // 1. Start ADC, Wait for conversion, Read, then Stop
+        	    HAL_ADC_Start(&hadc2);
+        	    if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK) {
+        	        uint32_t raw_adc = HAL_ADC_GetValue(&hadc2);
 
+        	        // 2. Conversion Math (Change 3.3 and 4095 based on your VREF)
+        	        // If you use a voltage divider (e.g., 10k/2k), multiply by the divider ratio!
+        	        battery_voltage = ((float)raw_adc / 4095.0f) * 3.3f * (DIVIDER_RATIO);
+        	    }
+        	    HAL_ADC_Stop(&hadc2);
                 /* 1. ACQUIRE SENSOR DATA */
                 MPU6050_Read();
 
@@ -382,25 +392,18 @@ int main(void)
                 // 1. Increase Baud Rate in CubeMX to 460800 or 921600
                 // 2. Optimization: Use a smaller buffer and shorter float precision
 
-                if (!uart_tx_busy) {
-                    static char tx_buffer[96];
-
-                    int len = snprintf(tx_buffer, sizeof(tx_buffer),
-                                       "$%u,%u,%.3f,%.3f,%.3f,%.3f\n",
-                                       loop_period_us, loop_exec_time_us,
-                                       acc_pitch, gyro_rate, estimated_pitch, pid_output);
-
-                    if (len > 0) {
-                        HAL_StatusTypeDef tx_status =
-                            HAL_UART_Transmit_DMA(&huart2, (uint8_t *)tx_buffer, len);
-
-                        if (tx_status == HAL_OK) {
-                            uart_tx_busy = 1;
-                        } else {
-                            uart_tx_busy = 0;
-                        }
-                    }
-                }}
+                // 1. Format the string (Matches the new 3-Screen MATLAB Dashboard)
+                                static char tx_buffer[96];
+                                // Added a 7th "%.2f" for the battery!
+                                int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                                                   "$%u,%u,%.3f,%.3f,%.3f,%.3f,%.2f\n",
+                                                   loop_period_us, loop_exec_time_us,
+                                                   acc_pitch, gyro_rate, estimated_pitch, pid_output, battery_voltage);
+                                // 2. The "Old Way": Brute-force blocking transmit
+                                if (len > 0) {
+                                    // Send it immediately. Wait up to 5ms for it to finish.
+                                    HAL_UART_Transmit(&huart2, (uint8_t *)tx_buffer, len, 5);
+                                }}
         }
   /* USER CODE END 3 */
 }
