@@ -29,23 +29,24 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* MPU6050 Configuration */
-#define MPU6050_ADDR (0x68 << 1)
-#define WHO_AM_I_REG 0x75
-#define PWR_MGMT_1_REG 0x6B
-#define ACCEL_XOUT_H_REG 0x3B
+#define MPU6050_ADDR       (0x68 << 1)
+#define WHO_AM_I_REG       0x75
+#define PWR_MGMT_1_REG     0x6B
+#define ACCEL_XOUT_H_REG   0x3B
 
 /* Operational Modes */
-#define MODE_BALANCING 0
-#define MODE_STEP_RESPONSE 1
-#define MODE_SWEEP 2
+#define MODE_BALANCING      0
+#define MODE_STEP_RESPONSE  1
+#define MODE_SWEEP          2
+#define MODE_FALL_TEST      3
 
 /* Filter & Control Constants */
-#define ALPHA 0.97f
-#define DT 0.005f
-#define RAD_TO_DEG 57.29577951f
-#define ACCEL_SCALE 16384.0f
-#define GYRO_SCALE 131.0f
-#define DIVIDER_RATIO 6.0f  // Adjust this based on your actual resistor values
+#define ALPHA           0.97f
+#define DT              0.005f
+#define RAD_TO_DEG      57.29577951f
+#define ACCEL_SCALE     16384.0f
+#define GYRO_SCALE      131.0f
+#define DIVIDER_RATIO   6.0f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,11 +64,11 @@ int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
 float estimated_pitch = 0.0f;
 
 /* PID Parameters */
-float Kp = 100.0f;
+float Kp = 500.0f;
 float Ki = 0.0f;
-float Kd = 100.0f;
+float Kd = 11.5f;
 
-float target_angle = -1.35449028f;
+float target_angle = -0.814726472f;
 float pid_error = 0.0f;
 float previous_error = 5.0f;
 float pid_integral = 0.0f;
@@ -76,7 +77,7 @@ float pid_output = 0.0f;
 /* System States */
 float battery_voltage = 0.0f;
 float current_speed = 0.0f;
-int test_mode = MODE_BALANCING;
+int test_mode = MODE_BALANCING;   /* Set to fall test */
 uint32_t test_timer = 0;
 float test_speed = 0.0f;
 
@@ -95,49 +96,47 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void MPU6050_Init(void) {
+
+void MPU6050_Init(void)
+{
     uint8_t data = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, PWR_MGMT_1_REG, 1, &data, 1, 1000);
 }
 
 HAL_StatusTypeDef i2c_status;
 
-void MPU6050_Read(void) {
-    // 1. Attempt the read with a strict 2ms timeout
+void MPU6050_Read(void)
+{
     i2c_status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H_REG, 1, rx_data, 14, 2);
 
-    // 2. CHECK THE RETURN STATUS
     if (i2c_status == HAL_OK) {
-        // Success! We have fresh, valid data. Safe to parse.
-        raw_acc_x = (int16_t)(rx_data[0] << 8 | rx_data[1]);
-        raw_acc_y = (int16_t)(rx_data[2] << 8 | rx_data[3]);
-        raw_acc_z = (int16_t)(rx_data[4] << 8 | rx_data[5]);
+        raw_acc_x  = (int16_t)(rx_data[0]  << 8 | rx_data[1]);
+        raw_acc_y  = (int16_t)(rx_data[2]  << 8 | rx_data[3]);
+        raw_acc_z  = (int16_t)(rx_data[4]  << 8 | rx_data[5]);
 
-        raw_gyro_x = (int16_t)(rx_data[8] << 8 | rx_data[9]);
+        raw_gyro_x = (int16_t)(rx_data[8]  << 8 | rx_data[9]);
         raw_gyro_y = (int16_t)(rx_data[10] << 8 | rx_data[11]);
         raw_gyro_z = (int16_t)(rx_data[12] << 8 | rx_data[13]);
-    }
-    else {
-        // FAILURE! The sensor disconnected, timed out, or glitched.
-        // Do NOT parse the data.
-
-        // Safety feature: Kill the motors immediately so the robot
-        // doesn't run away blindly using old PID data.
+    } else {
+        /* Kill motor outputs on sensor failure */
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
     }
 }
-float update_complementary_filter(float acc_pitch, float gyro_rate) {
+
+float update_complementary_filter(float acc_pitch, float gyro_rate)
+{
     estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * DT) + (1.0f - ALPHA) * acc_pitch;
     return estimated_pitch;
 }
 
-float calculate_PID(float current_pitch, float gyro_rate) {
+float calculate_PID(float current_pitch, float gyro_rate)
+{
     pid_error = current_pitch - target_angle;
     float P_out = Kp * pid_error;
 
     pid_integral += pid_error * DT;
-    if (pid_integral > 400.0f) pid_integral = 400.0f;
+    if (pid_integral > 400.0f)  pid_integral = 400.0f;
     if (pid_integral < -400.0f) pid_integral = -400.0f;
     float I_out = Ki * pid_integral;
 
@@ -147,83 +146,66 @@ float calculate_PID(float current_pitch, float gyro_rate) {
     return pid_output;
 }
 
-void set_motor_speed(float target_speed) {
-    // 1. Trap NaN or Infinity before they hit the hardware
+void set_motor_speed(float target_speed)
+{
     if (isnan(target_speed) || isinf(target_speed)) {
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
         return;
     }
-    // CLAMP TARGET HERE, BEFORE THE LIMITER
-        if (target_speed > 3000.0f) target_speed = 3000.0f;
-        if (target_speed < -3000.0f) target_speed = -3000.0f;
 
-        // --- 2. THE ADVANCED SLEW RATE LIMITER ---
-            static float current_speed = 0.0f;
+    if (target_speed > 3000.0f)  target_speed = 3000.0f;
+    if (target_speed < -3000.0f) target_speed = -3000.0f;
 
-            // TUNE THESE TWO VARIABLES:
-            float max_change_per_loop = 265.0f; // Push this as high as you can before stalling
-            float instant_kick_speed = 500.0f; // The speed the motor can instantly jump to from 0
+    static float slewed_speed = 0.0f;
 
-            // If the motor is currently stopped, allow an instant jump to the kick speed
-            if (current_speed == 0.0f && target_speed > instant_kick_speed) {
-                current_speed = instant_kick_speed;
-            }
-            else if (current_speed == 0.0f && target_speed < -instant_kick_speed) {
-                current_speed = -instant_kick_speed;
-            }
-            // Otherwise, apply the normal acceleration ramp
-            else {
-                if (target_speed > current_speed + max_change_per_loop) {
-                    current_speed += max_change_per_loop;
-                }
-                else if (target_speed < current_speed - max_change_per_loop) {
-                    current_speed -= max_change_per_loop;
-                }
-                else {
-                    current_speed = target_speed;
-                }
-            }
+    float max_change_per_loop = 2000.0f;
+    float instant_kick_speed  = 2000.0f;
 
-    // Use the smoothed speed for the physical hardware logic
-    float applied_speed = current_speed;
+    if (slewed_speed == 0.0f && target_speed > instant_kick_speed) {
+        slewed_speed = instant_kick_speed;
+    } else if (slewed_speed == 0.0f && target_speed < -instant_kick_speed) {
+        slewed_speed = -instant_kick_speed;
+    } else {
+        if (target_speed > slewed_speed + max_change_per_loop) {
+            slewed_speed += max_change_per_loop;
+        } else if (target_speed < slewed_speed - max_change_per_loop) {
+            slewed_speed -= max_change_per_loop;
+        } else {
+            slewed_speed = target_speed;
+        }
+    }
 
-    // --- 3. HARDWARE UPDATES ---
-    /* Handle Direction States */
+    float applied_speed = slewed_speed;
+
     if (applied_speed >= 0) {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_SET);
     } else {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
-        applied_speed = -applied_speed; // Make positive for timer math
+        applied_speed = -applied_speed;
     }
 
-    /* Enforce deadzone to prevent audible motor hum at zero speed */
     if (applied_speed < 20.0f) {
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
         return;
     }
 
-    /* Cap upper limit to prevent 16-bit timer overflow */
-    // Note: I kept your original logic, but jumping from 3000 to 20000
-    // is a massive leap! You might want to just clamp it to 3000.0f.
     if (applied_speed > 3000.0f) applied_speed = 3000.0f;
 
-    /* Calculate timer Auto-Reload Register (ARR) for target frequency */
-    // Assuming your timer clock is 1MHz (170MHz / 170 prescaler)
     uint32_t timer_arr = (uint32_t)(1000000.0f / applied_speed) - 1;
 
-    /* Synchronize dual timer updates */
     __disable_irq();
-    htim1.Instance->ARR = timer_arr;
-    htim1.Instance->CCR1 = timer_arr / 2; // Keep 50% duty cycle
+    htim1.Instance->ARR  = timer_arr;
+    htim1.Instance->CCR1 = timer_arr / 2;
 
-    htim4.Instance->ARR = timer_arr;
-    htim4.Instance->CCR1 = timer_arr / 2; // Keep 50% duty cycle
+    htim4.Instance->ARR  = timer_arr;
+    htim4.Instance->CCR1 = timer_arr / 2;
     __enable_irq();
 }
+
 /* USER CODE END 0 */
 
 /**
@@ -262,149 +244,129 @@ int main(void)
   MX_USART2_UART_Init();
   MX_ADC2_Init();
   MX_TIM6_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-    HAL_TIM_Base_Start(&htim6);
+  HAL_TIM_Base_Start(&htim6);
   __HAL_TIM_SET_COUNTER(&htim6, 0);
   last_loop_stamp_us = 0;
-        /* Hardware Initialization Delay */
-        HAL_Delay(100);
-        MPU6050_Init();
 
-        /* Initialize Motor Drivers */
-        HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
+  HAL_Delay(100);
+  MPU6050_Init();
 
-        // --- THE FIX: ENABLE SHADOW REGISTERS ---
-        // This forces the timer to wait until the end of its current
-        // cycle before applying the new speed, preventing the 65k wrap-around stall.
-        htim1.Instance->CR1 |= TIM_CR1_ARPE;
-        htim4.Instance->CR1 |= TIM_CR1_ARPE;
+  /* Initialize Motor Driver Pins */
+  HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
 
-        // --- THE FIX: PERFECT SYNCHRONIZATION ---
-        // Reset both counters to exactly zero before starting them,
-        // so their PWM waves are perfectly aligned in time.
-        htim1.Instance->CNT = 0;
-        htim4.Instance->CNT = 0;
+  /* Default enable state at boot */
+  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
 
+  /* Enable shadow registers */
+  htim1.Instance->CR1 |= TIM_CR1_ARPE;
+  htim4.Instance->CR1 |= TIM_CR1_ARPE;
 
+  /* Sync counters */
+  htim1.Instance->CNT = 0;
+  htim4.Instance->CNT = 0;
 
-        /* Start PWM Channels */
-        HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-        HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
 
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-        while (1) {
-        	uint16_t now = __HAL_TIM_GET_COUNTER(&htim6);
-        	uint16_t elapsed = (uint16_t)(now - last_loop_stamp_us);
+    while (1) {
+        uint16_t now = __HAL_TIM_GET_COUNTER(&htim6);
+        uint16_t elapsed = (uint16_t)(now - last_loop_stamp_us);
 
-        	if (elapsed >= 5000) {
-        	    loop_period_us = elapsed;
-        	    last_loop_stamp_us = now;
+        if (elapsed >= 5000) { // 5ms Loop
+            loop_period_us = elapsed;
+            last_loop_stamp_us = now;
 
-        	    uint16_t exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
-        	    // 1. Start ADC, Wait for conversion, Read, then Stop
-        	    HAL_ADC_Start(&hadc2);
-        	    if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK) {
-        	        uint32_t raw_adc = HAL_ADC_GetValue(&hadc2);
+            uint16_t exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
 
-        	        // 2. Conversion Math (Change 3.3 and 4095 based on your VREF)
-        	        // If you use a voltage divider (e.g., 10k/2k), multiply by the divider ratio!
-        	        battery_voltage = ((float)raw_adc / 4095.0f) * 3.3f * (DIVIDER_RATIO);
-        	    }
-        	    HAL_ADC_Stop(&hadc2);
-                /* 1. ACQUIRE SENSOR DATA */
-                MPU6050_Read();
+            /* Battery ADC */
+            HAL_ADC_Start(&hadc2);
+            if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK) {
+                uint32_t raw_adc = HAL_ADC_GetValue(&hadc2);
+                battery_voltage = ((float)raw_adc / 4095.0f) * 3.3f * DIVIDER_RATIO;
+            }
+            HAL_ADC_Stop(&hadc2);
 
-                float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
-                float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE);
+            /* IMU Read */
+            MPU6050_Read();
 
-                /* 2. SENSOR FUSION */
-                update_complementary_filter(acc_pitch, gyro_rate);
+            float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
+            float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE);
 
-                /* 3. EXECUTE CURRENT MODE */
-                switch (test_mode) {
-                    case MODE_BALANCING:
-                        calculate_PID(estimated_pitch, gyro_rate);
-                        set_motor_speed(pid_output);
-                        break;
+            /* Sensor Fusion */
+            update_complementary_filter(acc_pitch, gyro_rate);
 
-                    case MODE_STEP_RESPONSE:
-                        // This test ramps speed every 0.5 seconds to find the stall point.
-                        // Ensure the robot is on a stand (wheels off the ground) for the first run!
+            /* Mode handling */
+            switch (test_mode) {
+                case MODE_BALANCING:
+                    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+                    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
+                    calculate_PID(estimated_pitch, gyro_rate);
+                    set_motor_speed(pid_output);
+                    break;
 
-                        test_timer++;
+                case MODE_STEP_RESPONSE:
+                    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+                    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
+                    test_timer++;
+                    if (test_timer < 100) test_speed = 0.0f;
+                    else if (test_timer < 1000) test_speed += 5.0f;
+                    else { test_speed = 0.0f; test_timer = 0; }
+                    set_motor_speed(test_speed);
+                    pid_output = test_speed;
+                    break;
 
-                        if (test_timer < 100) {
-                            test_speed = 0;          // Start at zero
-                        }
-                        else if (test_timer < 1000) { // 4.5 second ramp test
-                            // Increment speed by 5 units every 5ms loop
-                            // Result: Speed increases by 1000 units per second
-                            test_speed += 5.0f;
-                        }
-                        else {
-                            test_speed = 0;
-                            test_timer = 0;          // Reset test
-                        }
+                case MODE_FALL_TEST:
+                    pid_output = 0.0f;
+                    htim1.Instance->CCR1 = 0;
+                    htim4.Instance->CCR1 = 0;
+                    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
+                    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
+                    break;
 
-                        // Bypass the PID—send the test ramp directly to the motor logic
-                        set_motor_speed(test_speed);
+                default:
+                    break;
+            }
 
-                        // Log test_speed as pid_output for the Telemetry graph
-                        pid_output = test_speed;
-                        break;
+            loop_exec_time_us = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim6) - exec_start_us);
 
-                    case MODE_SWEEP:
-                    {
-                        static int sweep_direction = 1;
-                        float sweep_step = 2.0f;
+            // --- 1. HIGH-SPEED USB TELEMETRY (Every 5ms) ---
+            static char tx_buffer[96];
+            int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                               "$%u,%u,%.3f,%.3f,%.3f,%.3f,%.2f\n",
+                               loop_period_us, loop_exec_time_us,
+                               acc_pitch, gyro_rate, estimated_pitch, pid_output, battery_voltage);
+            if (len > 0) {
+                HAL_UART_Transmit(&huart2, (uint8_t *)tx_buffer, len, 2);
+            }
 
-                        if (sweep_direction == 1) {
-                            test_speed += sweep_step;
-                            if (test_speed >= 3000.0f) {
-                                sweep_direction = -1;
-                            }
-                        } else {
-                            test_speed -= sweep_step;
-                            if (test_speed <= 0.0f) {
-                                test_speed = 0.0f;
-                                sweep_direction = 1;
-                            }
-                        }
-
-                        set_motor_speed(test_speed);
-                        pid_output = test_speed;
-                        break;
-                    }
-
-                    default:
-                        break;
+            // --- 2. BLUETOOTH TELEMETRY (Every 50ms) ---
+            static uint8_t bt_counter = 0;
+            if (++bt_counter >= 10) {
+                bt_counter = 0;
+                static char bt_buffer[48];
+                // Using the compact format to ensure it fits in 1 BLE packet
+                int bt_len = snprintf(bt_buffer, sizeof(bt_buffer),
+                                      "P:%.0f,G:%.0f,M:%.0f,V:%.1f\n",
+                                      estimated_pitch, gyro_rate, pid_output, battery_voltage);
+                if (bt_len > 0) {
+                    // Using 115200 Baud, this takes ~2ms. 10ms timeout is safe.
+                    HAL_UART_Transmit(&huart1, (uint8_t *)bt_buffer, bt_len, 10);
                 }
-
-                loop_exec_time_us = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim6) - exec_start_us);
-
-                // 1. Increase Baud Rate in CubeMX to 460800 or 921600
-                // 2. Optimization: Use a smaller buffer and shorter float precision
-
-                // 1. Format the string (Matches the new 3-Screen MATLAB Dashboard)
-                                static char tx_buffer[96];
-                                // Added a 7th "%.2f" for the battery!
-                                int len = snprintf(tx_buffer, sizeof(tx_buffer),
-                                                   "$%u,%u,%.3f,%.3f,%.3f,%.3f,%.2f\n",
-                                                   loop_period_us, loop_exec_time_us,
-                                                   acc_pitch, gyro_rate, estimated_pitch, pid_output, battery_voltage);
-                                // 2. The "Old Way": Brute-force blocking transmit
-                                if (len > 0) {
-                                    // Send it immediately. Wait up to 5ms for it to finish.
-                                    HAL_UART_Transmit(&huart2, (uint8_t *)tx_buffer, len, 5);
-                                }}
+            }
         }
+    }
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
 }
 
@@ -470,7 +432,6 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
@@ -488,8 +449,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
