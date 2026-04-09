@@ -70,14 +70,14 @@ float Kd = 11.5f;
 
 float target_angle = -0.814726472f;
 float pid_error = 0.0f;
-float previous_error = 5.0f;
+float previous_error = 0.0f;
 float pid_integral = 0.0f;
 float pid_output = 0.0f;
 
 /* System States */
 float battery_voltage = 0.0f;
 float current_speed = 0.0f;
-int test_mode = MODE_BALANCING;   /* Set to fall test */
+int test_mode = MODE_BALANCING;   //can change between MODE_BALANCING, MODE_STEP_RESPONSE, MODE_SWEEP , MODE_FALL_TEST potential to add more for more detailed characterisation
 uint32_t test_timer = 0;
 float test_speed = 0.0f;
 
@@ -271,99 +271,150 @@ int main(void)
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-
+  //Telemtry Priority
+  static uint8_t batt_div = 0;   // every 10 loops = 50 ms
+  static uint8_t bt_div   = 0;   // every 20 loops = 100 ms
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-    while (1) {
-        uint16_t now = __HAL_TIM_GET_COUNTER(&htim6);
-        uint16_t elapsed = (uint16_t)(now - last_loop_stamp_us);
+  while (1)
+  {
+      uint16_t now = __HAL_TIM_GET_COUNTER(&htim6);
+      uint16_t elapsed = (uint16_t)(now - last_loop_stamp_us);
 
-        if (elapsed >= 5000) { // 5ms Loop
-            loop_period_us = elapsed;
-            last_loop_stamp_us = now;
+      if (elapsed >= 5000)   // 5 ms loop
+      {
+          loop_period_us = elapsed;
+          last_loop_stamp_us = now;
 
-            uint16_t exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
+          uint16_t exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
 
-            /* Battery ADC */
-            HAL_ADC_Start(&hadc2);
-            if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK) {
-                uint32_t raw_adc = HAL_ADC_GetValue(&hadc2);
-                battery_voltage = ((float)raw_adc / 4095.0f) * 3.3f * DIVIDER_RATIO;
-            }
-            HAL_ADC_Stop(&hadc2);
+          /* --- Battery ADC --- */
+          HAL_ADC_Start(&hadc2);
+          if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK)
+          {
+              uint32_t raw_adc = HAL_ADC_GetValue(&hadc2);
+              battery_voltage = ((float)raw_adc / 4095.0f) * 3.3f * DIVIDER_RATIO;
+          }
+          HAL_ADC_Stop(&hadc2);
 
-            /* IMU Read */
-            MPU6050_Read();
+          /* --- IMU Read --- */
+          MPU6050_Read();
 
-            float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
-            float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE);
+          float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
+          float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE);
 
-            /* Sensor Fusion */
-            update_complementary_filter(acc_pitch, gyro_rate);
+          /* --- Sensor Fusion --- */
+          update_complementary_filter(acc_pitch, gyro_rate);
 
-            /* Mode handling */
-            switch (test_mode) {
-                case MODE_BALANCING:
-                    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-                    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
-                    calculate_PID(estimated_pitch, gyro_rate);
-                    set_motor_speed(pid_output);
-                    break;
+          /* --- Mode Handling --- */
+          switch (test_mode)
+          {
+              case MODE_BALANCING:
+                  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+                  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
 
-                case MODE_STEP_RESPONSE:
-                    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-                    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
-                    test_timer++;
-                    if (test_timer < 100) test_speed = 0.0f;
-                    else if (test_timer < 1000) test_speed += 5.0f;
-                    else { test_speed = 0.0f; test_timer = 0; }
-                    set_motor_speed(test_speed);
-                    pid_output = test_speed;
-                    break;
+                  calculate_PID(estimated_pitch, gyro_rate);
+                  set_motor_speed(pid_output);
+                  break;
 
-                case MODE_FALL_TEST:
-                    pid_output = 0.0f;
-                    htim1.Instance->CCR1 = 0;
-                    htim4.Instance->CCR1 = 0;
-                    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
-                    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
-                    break;
+              case MODE_STEP_RESPONSE:
+                  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+                  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
 
-                default:
-                    break;
-            }
+                  test_timer++;
+                  if (test_timer < 100)          test_speed = 0.0f;
+                  else if (test_timer < 1000)    test_speed += 5.0f;
+                  else
+                  {
+                      test_speed = 0.0f;
+                      test_timer = 0;
+                  }
 
-            loop_exec_time_us = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim6) - exec_start_us);
+                  set_motor_speed(test_speed);
+                  pid_output = test_speed;
+                  break;
 
-            // --- 1. HIGH-SPEED USB TELEMETRY (Every 5ms) ---
-            static char tx_buffer[96];
-            int len = snprintf(tx_buffer, sizeof(tx_buffer),
-                               "$%u,%u,%.3f,%.3f,%.3f,%.3f,%.2f\n",
-                               loop_period_us, loop_exec_time_us,
-                               acc_pitch, gyro_rate, estimated_pitch, pid_output, battery_voltage);
-            if (len > 0) {
-                HAL_UART_Transmit(&huart2, (uint8_t *)tx_buffer, len, 2);
-            }
+              case MODE_FALL_TEST:
+                  pid_output = 0.0f;
+                  htim1.Instance->CCR1 = 0;
+                  htim4.Instance->CCR1 = 0;
+                  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
+                  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
+                  break;
 
-            // --- 2. BLUETOOTH TELEMETRY (Every 50ms) ---
-            static uint8_t bt_counter = 0;
-            if (++bt_counter >= 10) {
-                bt_counter = 0;
-                static char bt_buffer[48];
-                // Using the compact format to ensure it fits in 1 BLE packet
-                int bt_len = snprintf(bt_buffer, sizeof(bt_buffer),
-                                      "P:%.0f,G:%.0f,M:%.0f,V:%.1f\n",
-                                      estimated_pitch, gyro_rate, pid_output, battery_voltage);
-                if (bt_len > 0) {
-                    // Using 115200 Baud, this takes ~2ms. 10ms timeout is safe.
-                    HAL_UART_Transmit(&huart1, (uint8_t *)bt_buffer, bt_len, 10);
-                }
-            }
-        }
-    }
+              default:
+                  break;
+          }
+
+          loop_exec_time_us = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim6) - exec_start_us);
+
+          /* =========================================================
+             USB / MATLAB telemetry on USART2 @ 460800
+             ========================================================= */
+
+          /* A packet: every 5 ms (critical) */
+          {
+              char usbA[64];
+              int len = snprintf(usbA, sizeof(usbA),
+                                 "A,%.3f,%.3f,%.3f,%.3f\n",
+                                 acc_pitch, gyro_rate, estimated_pitch, pid_output);
+              if (len > 0)
+              {
+                  HAL_UART_Transmit(&huart2, (uint8_t *)usbA, len, 2);
+              }
+          }
+
+          /* B packet: every 5 ms (timing) */
+          {
+              char usbB[32];
+              int len = snprintf(usbB, sizeof(usbB),
+                                 "B,%u,%u\n",
+                                 loop_period_us, loop_exec_time_us);
+              if (len > 0)
+              {
+                  HAL_UART_Transmit(&huart2, (uint8_t *)usbB, len, 2);
+              }
+          }
+
+          /* C packet: every 50 ms (battery) */
+          if (++batt_div >= 10)
+          {
+              batt_div = 0;
+
+              char usbC[20];
+              int len = snprintf(usbC, sizeof(usbC),
+                                 "C,%.2f\n",
+                                 battery_voltage);
+              if (len > 0)
+              {
+                  HAL_UART_Transmit(&huart2, (uint8_t *)usbC, len, 2);
+              }
+          }
+
+          /* =========================================================
+             Slower Bluetooth summary on USART1
+             Only do this during balancing if USART1 is raised to 115200.
+             ========================================================= */
+
+          if (++bt_div >= 20)   // every 100 ms
+          {
+              bt_div = 0;
+
+              char bt[40];
+              int len = snprintf(bt, sizeof(bt),
+                                 "S,%.1f,%.1f,%.0f,%.1f\n",
+                                 estimated_pitch, gyro_rate, pid_output, battery_voltage);
+
+              if (len > 0)
+              {
+                  HAL_UART_Transmit(&huart1, (uint8_t *)bt, len, 5);
+              }
+          }
+      }
+  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
