@@ -14,6 +14,8 @@
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
+#include <stdlib.h>
+
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -62,13 +64,15 @@ uint8_t rx_data[14];
 int16_t raw_acc_x, raw_acc_y, raw_acc_z;
 int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
 float estimated_pitch = 0.0f;
+static float gyro_bias_x = 0.0f;
+static float pitch_zero  = 0.0f;
 
 /* PID Parameters */
-float Kp = 500.0f;
-float Ki = 0.0f;
-float Kd = 11.5f;
+float Kp = 800.0f;
+float Ki = 2.5f;
+float Kd = 30.0f;
 
-float target_angle = -0.814726472f;
+float target_angle = 0.0f;
 float pid_error = 0.0f;
 float previous_error = 0.0f;
 float pid_integral = 0.0f;
@@ -123,13 +127,32 @@ void MPU6050_Read(void)
         htim4.Instance->CCR1 = 0;
     }
 }
-
-float update_complementary_filter(float acc_pitch, float gyro_rate)
+static void IMU_CalibrateAtRest(void)
 {
-    estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * DT) + (1.0f - ALPHA) * acc_pitch;
-    return estimated_pitch;
+    const int N = 500;
+    float gyro_sum = 0.0f;
+    float acc_sum  = 0.0f;
+
+    for (int i = 0; i < N; i++)
+    {
+        MPU6050_Read();
+        gyro_sum += -((float)raw_gyro_x / GYRO_SCALE);
+        acc_sum  += -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
+        HAL_Delay(2); // Wait 2ms between reads
+    }
+
+    gyro_bias_x = gyro_sum / N;
+    pitch_zero  = acc_sum / N;
+
+    /* The controller now sees this exact resting position as 0.0 degrees */
+    estimated_pitch = 0.0f;
 }
 
+float update_complementary_filter(float acc_pitch, float gyro_rate, float dynamic_dt)
+{
+    estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * dynamic_dt) + (1.0f - ALPHA) * acc_pitch;
+    return estimated_pitch;
+}
 float calculate_PID(float current_pitch, float gyro_rate)
 {
     pid_error = current_pitch - target_angle;
@@ -187,7 +210,7 @@ void set_motor_speed(float target_speed)
         applied_speed = -applied_speed;
     }
 
-    if (applied_speed < 20.0f) {
+    if (applied_speed < 10.0f) {
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
         return;
@@ -252,7 +275,7 @@ int main(void)
 
   HAL_Delay(100);
   MPU6050_Init();
-
+  IMU_CalibrateAtRest();
   /* Initialize Motor Driver Pins */
   HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
@@ -273,7 +296,8 @@ int main(void)
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
   //Telemtry Priority
   static uint8_t batt_div = 0;   // every 10 loops = 50 ms
-  static uint8_t bt_div   = 0;   // every 20 loops = 100 ms
+  static char bt_cmd_buf[32];
+  static uint8_t bt_cmd_idx = 0;
 
   /* USER CODE END 2 */
 
@@ -301,13 +325,17 @@ int main(void)
           HAL_ADC_Stop(&hadc2);
 
           /* --- IMU Read --- */
-          MPU6050_Read();
+	      MPU6050_Read();
 
-          float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
-          float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE);
+          // Calculate dynamic dt based on the actual hardware timer
+          float dynamic_dt = loop_period_us * 1e-6f;
+
+          // Subtract the offsets calculated during startup
+          float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG) - pitch_zero;
+          float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE) - gyro_bias_x;
 
           /* --- Sensor Fusion --- */
-          update_complementary_filter(acc_pitch, gyro_rate);
+          update_complementary_filter(acc_pitch, gyro_rate, dynamic_dt);
 
           /* --- Mode Handling --- */
           switch (test_mode)
@@ -395,22 +423,40 @@ int main(void)
           }
 
           /* =========================================================
-             Slower Bluetooth summary on USART1
-             Only do this during balancing if USART1 is raised to 115200.
+             USART1
+
              ========================================================= */
 
-          if (++bt_div >= 20)   // every 100 ms
+          uint8_t ch;
+
+          /* Drain ALL available characters from the UART RX register */
+          while (HAL_UART_Receive(&huart1, &ch, 1, 0) == HAL_OK)
           {
-              bt_div = 0;
-
-              char bt[40];
-              int len = snprintf(bt, sizeof(bt),
-                                 "S,%.1f,%.1f,%.0f,%.1f\n",
-                                 estimated_pitch, gyro_rate, pid_output, battery_voltage);
-
-              if (len > 0)
+              if (ch == '\n' || ch == '\r')
               {
-                  HAL_UART_Transmit(&huart1, (uint8_t *)bt, len, 5);
+                  bt_cmd_buf[bt_cmd_idx] = '\0'; // Null terminate
+
+                  if (bt_cmd_buf[0] == 'P') {
+                      Kp = atof(&bt_cmd_buf[1]);
+                      pid_integral = 0.0f; // Reset integral to prevent violent jumps
+                  }
+                  else if (bt_cmd_buf[0] == 'I') {
+                      Ki = atof(&bt_cmd_buf[1]);
+                      pid_integral = 0.0f;
+                  }
+                  else if (bt_cmd_buf[0] == 'D') {
+                      Kd = atof(&bt_cmd_buf[1]);
+                  }
+
+                  bt_cmd_idx = 0; // Reset index for next command
+              }
+              else if (bt_cmd_idx < sizeof(bt_cmd_buf) - 1)
+              {
+                  bt_cmd_buf[bt_cmd_idx++] = (char)ch;
+              }
+              else
+              {
+                  bt_cmd_idx = 0; // Buffer overflow protection, reset
               }
           }
       }
