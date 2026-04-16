@@ -43,7 +43,7 @@
 #define MODE_FALL_TEST      3
 
 /* Filter & Control Constants */
-#define ALPHA           0.97f
+#define ALPHA           0.985f   // Optimized to prevent scale-factor drift leaning
 #define DT              0.005f
 #define RAD_TO_DEG      57.29577951f
 #define ACCEL_SCALE     16384.0f
@@ -67,21 +67,27 @@ float estimated_pitch = 0.0f;
 static float gyro_bias_x = 0.0f;
 static float pitch_zero  = 0.0f;
 
-/* PID Parameters */
+/* Inner Loop: Pitch PID Parameters */
 float Kp = 800.0f;
-float Ki = 2.5f;
-float Kd = 30.0f;
+float Ki = 10.0f;
+float Kd = 33.0f;
 
-float target_angle = 0.0f;
 float pid_error = 0.0f;
 float previous_error = 0.0f;
 float pid_integral = 0.0f;
 float pid_output = 0.0f;
 
+/* Outer Loop: Velocity Control Parameters */
+float target_angle = 0.0f;
+float speed_integral = 0.0f;
+float speed_Kp = 0.0009f;
+float speed_Ki = 0.0005f;
+static float chassis_velocity = 0.0f; // Low-pass filtered motor output
+
 /* System States */
 float battery_voltage = 0.0f;
 float current_speed = 0.0f;
-int test_mode = MODE_BALANCING;   //can change between MODE_BALANCING, MODE_STEP_RESPONSE, MODE_SWEEP , MODE_FALL_TEST potential to add more for more detailed characterisation
+int test_mode = MODE_BALANCING;
 uint32_t test_timer = 0;
 float test_speed = 0.0f;
 
@@ -127,6 +133,7 @@ void MPU6050_Read(void)
         htim4.Instance->CCR1 = 0;
     }
 }
+
 static void IMU_CalibrateAtRest(void)
 {
     const int N = 500;
@@ -153,19 +160,27 @@ float update_complementary_filter(float acc_pitch, float gyro_rate, float dynami
     estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * dynamic_dt) + (1.0f - ALPHA) * acc_pitch;
     return estimated_pitch;
 }
-float calculate_PID(float current_pitch, float gyro_rate)
+
+float calculate_PID(float current_pitch, float gyro_rate, float dynamic_dt)
 {
     pid_error = current_pitch - target_angle;
     float P_out = Kp * pid_error;
 
-    pid_integral += pid_error * DT;
+    /* 1. Integral: Use hardware-measured dt for mathematically perfect accumulation */
+    pid_integral += pid_error * dynamic_dt;
     if (pid_integral > 400.0f)  pid_integral = 400.0f;
     if (pid_integral < -400.0f) pid_integral = -400.0f;
     float I_out = Ki * pid_integral;
 
-    float D_out = Kd * gyro_rate;
+    /* 2. Derivative: Direct Gyro Feedback + EMA Low-Pass Filter (PID-F) */
+    static float D_filtered = 0.0f;
+    float D_raw = Kd * gyro_rate;
 
-    pid_output = P_out + I_out + D_out;
+    // Beta = 0.4 ensures minimal phase-lag while still smoothing mechanical impacts
+    const float beta = 0.4f;
+    D_filtered = (beta * D_filtered) + ((1.0f - beta) * D_raw);
+
+    pid_output = P_out + I_out + D_filtered;
     return pid_output;
 }
 
@@ -177,48 +192,59 @@ void set_motor_speed(float target_speed)
         return;
     }
 
-    if (target_speed > 3000.0f)  target_speed = 3000.0f;
-    if (target_speed < -3000.0f) target_speed = -3000.0f;
+    float compensated_speed = target_speed;
 
+    /* Clamp absolute limits */
+    if (compensated_speed > 4000.0f)  compensated_speed = 4000.0f;
+    if (compensated_speed < -4000.0f) compensated_speed = -4000.0f;
+
+    /* --- 1. SLEW RATE LIMITER --- */
     static float slewed_speed = 0.0f;
+    float max_change_per_loop = 80.0f;
+    float instant_kick_speed  = 75.0f;
 
-    float max_change_per_loop = 2000.0f;
-    float instant_kick_speed  = 2000.0f;
-
-    if (slewed_speed == 0.0f && target_speed > instant_kick_speed) {
+    if (slewed_speed == 0.0f && compensated_speed > instant_kick_speed) {
         slewed_speed = instant_kick_speed;
-    } else if (slewed_speed == 0.0f && target_speed < -instant_kick_speed) {
+    } else if (slewed_speed == 0.0f && compensated_speed < -instant_kick_speed) {
         slewed_speed = -instant_kick_speed;
     } else {
-        if (target_speed > slewed_speed + max_change_per_loop) {
+        if (compensated_speed > slewed_speed + max_change_per_loop) {
             slewed_speed += max_change_per_loop;
-        } else if (target_speed < slewed_speed - max_change_per_loop) {
+        } else if (compensated_speed < slewed_speed - max_change_per_loop) {
             slewed_speed -= max_change_per_loop;
         } else {
-            slewed_speed = target_speed;
+            slewed_speed = compensated_speed;
         }
     }
 
     float applied_speed = slewed_speed;
 
+    /* --- 2. DIRECTION & HARDWARE TIMERS --- */
     if (applied_speed >= 0) {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_SET);
     } else {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
-        applied_speed = -applied_speed;
+        applied_speed = -applied_speed; // Absolute value for timer calculation
     }
 
-    if (applied_speed < 10.0f) {
+    /* --- 3. CRITICAL 16-BIT TIMER CUTOFF ---
+       The 16-bit timer physically CANNOT step slower than 15.26 Hz.
+       We cut power cleanly below 15.5 Hz to allow the robot to stand still
+       and mathematically prevent an 884 Hz integer overflow spike. */
+    if (applied_speed < 15.5f) {
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
         return;
     }
 
-    if (applied_speed > 3000.0f) applied_speed = 3000.0f;
-
     uint32_t timer_arr = (uint32_t)(1000000.0f / applied_speed) - 1;
+
+    // Failsafe Guard against any residual overflows
+    if (timer_arr > 65535) {
+        timer_arr = 65535;
+    }
 
     __disable_irq();
     htim1.Instance->ARR  = timer_arr;
@@ -228,7 +254,6 @@ void set_motor_speed(float target_speed)
     htim4.Instance->CCR1 = timer_arr / 2;
     __enable_irq();
 }
-
 /* USER CODE END 0 */
 
 /**
@@ -268,6 +293,7 @@ int main(void)
   MX_ADC2_Init();
   MX_TIM6_Init();
   MX_USART1_UART_Init();
+
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start(&htim6);
   __HAL_TIM_SET_COUNTER(&htim6, 0);
@@ -276,6 +302,7 @@ int main(void)
   HAL_Delay(100);
   MPU6050_Init();
   IMU_CalibrateAtRest();
+
   /* Initialize Motor Driver Pins */
   HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
@@ -294,7 +321,8 @@ int main(void)
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
-  //Telemtry Priority
+
+  // Telemetry Priority
   static uint8_t batt_div = 0;   // every 10 loops = 50 ms
   static char bt_cmd_buf[32];
   static uint8_t bt_cmd_idx = 0;
@@ -341,14 +369,39 @@ int main(void)
           switch (test_mode)
           {
               case MODE_BALANCING:
+              {
                   HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
                   HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
 
-                  calculate_PID(estimated_pitch, gyro_rate);
+                  /* --- 1. OUTER LOOP: Velocity Cascade Control --- */
+                  // Low-pass filter the motor output to estimate steady chassis velocity
+                  chassis_velocity = (0.75f * chassis_velocity) + (0.25f * pid_output);
+
+                  // PI Controller to keep velocity at 0
+                  float target_speed = 0.0f;
+                  float speed_error = target_speed - chassis_velocity;
+
+                  speed_integral += speed_error * dynamic_dt;
+
+                  // Clamp the integral so the robot doesn't lean too aggressively
+                  if (speed_integral > 8000.0f)  speed_integral = 8000.0f;
+                  if (speed_integral < -8000.0f) speed_integral = -8000.0f;
+
+                  // Calculate the new target lean angle required to stop the drift
+                  target_angle = (speed_error * speed_Kp) + (speed_integral * speed_Ki);
+
+                  // Safety clamp: Never let the speed loop command more than a 2.5 degree lean
+                  if (target_angle > 2.5f)  target_angle = 2.5f;
+                  if (target_angle < -2.5f) target_angle = -2.5f;
+
+                  /* --- 2. INNER LOOP: Pitch Control --- */
+                  calculate_PID(estimated_pitch, gyro_rate, dynamic_dt);
                   set_motor_speed(pid_output);
                   break;
+              }
 
               case MODE_STEP_RESPONSE:
+              {
                   HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
                   HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
 
@@ -364,14 +417,17 @@ int main(void)
                   set_motor_speed(test_speed);
                   pid_output = test_speed;
                   break;
+              }
 
               case MODE_FALL_TEST:
+              {
                   pid_output = 0.0f;
                   htim1.Instance->CCR1 = 0;
                   htim4.Instance->CCR1 = 0;
                   HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
                   HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
                   break;
+              }
 
               default:
                   break;
@@ -423,8 +479,7 @@ int main(void)
           }
 
           /* =========================================================
-             USART1
-
+             USART1 (Bluetooth Tuning)
              ========================================================= */
 
           uint8_t ch;
@@ -461,9 +516,9 @@ int main(void)
           }
       }
   }
-    /* USER CODE END WHILE */
+  /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
+  /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
 }
 
@@ -535,6 +590,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
