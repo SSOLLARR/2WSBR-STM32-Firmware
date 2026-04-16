@@ -43,7 +43,7 @@
 #define MODE_FALL_TEST      3
 
 /* Filter & Control Constants */
-#define ALPHA           0.985f   // Optimized to prevent scale-factor drift leaning
+#define ALPHA           0.975f   // Optimized to prevent scale-factor drift leaning
 #define DT              0.005f
 #define RAD_TO_DEG      57.29577951f
 #define ACCEL_SCALE     16384.0f
@@ -69,8 +69,8 @@ static float pitch_zero  = 0.0f;
 
 /* Inner Loop: Pitch PID Parameters */
 float Kp = 800.0f;
-float Ki = 10.0f;
-float Kd = 33.0f;
+float Ki = 2.5f;
+float Kd = 1000.0f;
 
 float pid_error = 0.0f;
 float previous_error = 0.0f;
@@ -80,9 +80,16 @@ float pid_output = 0.0f;
 /* Outer Loop: Velocity Control Parameters */
 float target_angle = 0.0f;
 float speed_integral = 0.0f;
-float speed_Kp = 0.0009f;
-float speed_Ki = 0.0005f;
+float speed_Kp = 0.0001f;
+float speed_Ki = 0.0004f;
 static float chassis_velocity = 0.0f; // Low-pass filtered motor output
+
+/* Fall Detection States */
+#define SAFE_ANGLE_LIMIT    8.0f   // Degrees: Beyond this, we consider it a fall
+#define FALL_TIME_LIMIT_MS  1500   // 1.5 seconds
+uint32_t fall_timer_ms = 0;
+uint8_t  is_falling = 0;
+
 
 /* System States */
 float battery_voltage = 0.0f;
@@ -164,26 +171,29 @@ float update_complementary_filter(float acc_pitch, float gyro_rate, float dynami
 float calculate_PID(float current_pitch, float gyro_rate, float dynamic_dt)
 {
     pid_error = current_pitch - target_angle;
-    float P_out = Kp * pid_error;
 
-    /* 1. Integral: Use hardware-measured dt for mathematically perfect accumulation */
+    /* --- NON-LINEAR PROPORTIONAL TERM --- */
+    // As error grows, Kp grows exponentially to violently catch dives
+    float aggression_multiplier = 150.0f;
+    float dynamic_Kp = Kp + (fabs(pid_error) * aggression_multiplier);
+
+    float P_out = dynamic_Kp * pid_error;
+
+    /* 1. Integral */
     pid_integral += pid_error * dynamic_dt;
     if (pid_integral > 400.0f)  pid_integral = 400.0f;
     if (pid_integral < -400.0f) pid_integral = -400.0f;
     float I_out = Ki * pid_integral;
 
-    /* 2. Derivative: Direct Gyro Feedback + EMA Low-Pass Filter (PID-F) */
+    /* 2. Derivative */
     static float D_filtered = 0.0f;
     float D_raw = Kd * gyro_rate;
-
-    // Beta = 0.4 ensures minimal phase-lag while still smoothing mechanical impacts
     const float beta = 0.4f;
     D_filtered = (beta * D_filtered) + ((1.0f - beta) * D_raw);
 
     pid_output = P_out + I_out + D_filtered;
     return pid_output;
 }
-
 void set_motor_speed(float target_speed)
 {
     if (isnan(target_speed) || isinf(target_speed)) {
@@ -195,13 +205,13 @@ void set_motor_speed(float target_speed)
     float compensated_speed = target_speed;
 
     /* Clamp absolute limits */
-    if (compensated_speed > 4000.0f)  compensated_speed = 4000.0f;
-    if (compensated_speed < -4000.0f) compensated_speed = -4000.0f;
+    if (compensated_speed > 5000.0f)  compensated_speed = 5000.0f;
+    if (compensated_speed < -5000.0f) compensated_speed = -5000.0f;
 
     /* --- 1. SLEW RATE LIMITER --- */
     static float slewed_speed = 0.0f;
-    float max_change_per_loop = 80.0f;
-    float instant_kick_speed  = 75.0f;
+    float max_change_per_loop = 150.0f;
+    float instant_kick_speed  = 200.0f;
 
     if (slewed_speed == 0.0f && compensated_speed > instant_kick_speed) {
         slewed_speed = instant_kick_speed;
@@ -368,37 +378,71 @@ int main(void)
           /* --- Mode Handling --- */
           switch (test_mode)
           {
-              case MODE_BALANCING:
-              {
-                  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-                  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
+          case MODE_BALANCING:
+                        {
+                            /* --- FALL DETECTION LOGIC --- */
+                            // If the robot leans past the safe limit, start the timer
+                            if (fabs(estimated_pitch) > SAFE_ANGLE_LIMIT) {
+                                fall_timer_ms += (uint32_t)(dynamic_dt * 1000.0f); // Add ~5ms
+                            } else {
+                                // If it recovers into the safe zone, reset the timer
+                                fall_timer_ms = 0;
+                                is_falling = 0;
+                            }
 
-                  /* --- 1. OUTER LOOP: Velocity Cascade Control --- */
-                  // Low-pass filter the motor output to estimate steady chassis velocity
-                  chassis_velocity = (0.75f * chassis_velocity) + (0.25f * pid_output);
+                            // If it has been falling for longer than the limit, trigger the failsafe
+                            if (fall_timer_ms >= FALL_TIME_LIMIT_MS) {
+                                is_falling = 1;
+                            }
 
-                  // PI Controller to keep velocity at 0
-                  float target_speed = 0.0f;
-                  float speed_error = target_speed - chassis_velocity;
+                            /* --- BEHAVIOR --- */
+                            if (is_falling == 1) {
+                                // EMERGENCY STATE: Arrest the dive or kill power
 
-                  speed_integral += speed_error * dynamic_dt;
+                                // Option A: Kill Power (Drop to the floor safely)
+                                pid_output = 0.0f;
+                                htim1.Instance->CCR1 = 0;
+                                htim4.Instance->CCR1 = 0;
+                                HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
+                                HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
 
-                  // Clamp the integral so the robot doesn't lean too aggressively
-                  if (speed_integral > 8000.0f)  speed_integral = 8000.0f;
-                  if (speed_integral < -8000.0f) speed_integral = -8000.0f;
+                                // (Optional) Automatically reset to balancing mode if you pick it back up
+                                // if (fabs(estimated_pitch) < 1.0f) {
+                                //     fall_timer_ms = 0;
+                                //     is_falling = 0;
+                                //     // Reset integral accumulators so it doesn't instantly jump
+                                //     pid_integral = 0;
+                                //     speed_integral = 0;
+                                // }
 
-                  // Calculate the new target lean angle required to stop the drift
-                  target_angle = (speed_error * speed_Kp) + (speed_integral * speed_Ki);
+                            } else {
+                                // NORMAL BALANCING STATE
+                                HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+                                HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
 
-                  // Safety clamp: Never let the speed loop command more than a 2.5 degree lean
-                  if (target_angle > 2.5f)  target_angle = 2.5f;
-                  if (target_angle < -2.5f) target_angle = -2.5f;
+                                /* --- 1. OUTER LOOP: Velocity Cascade Control --- */
+                                chassis_velocity = (0.85f * chassis_velocity) + (0.15f * pid_output);
 
-                  /* --- 2. INNER LOOP: Pitch Control --- */
-                  calculate_PID(estimated_pitch, gyro_rate, dynamic_dt);
-                  set_motor_speed(pid_output);
-                  break;
-              }
+                                float target_speed = 0.0f;
+                                float speed_error = target_speed - chassis_velocity;
+
+                                speed_integral += speed_error * dynamic_dt;
+
+                                if (speed_integral > 8000.0f)  speed_integral = 8000.0f;
+                                if (speed_integral < -8000.0f) speed_integral = -8000.0f;
+
+                                target_angle = (speed_error * speed_Kp) + (speed_integral * speed_Ki);
+
+                                // Outer loop authority clamp
+                                if (target_angle > 1.7f)  target_angle = 1.7f;
+                                if (target_angle < -1.7f) target_angle = -1.7f;
+
+                                /* --- 2. INNER LOOP: Pitch Control --- */
+                                calculate_PID(estimated_pitch, gyro_rate, dynamic_dt);
+                                set_motor_speed(pid_output);
+                            }
+                            break;
+                        }
 
               case MODE_STEP_RESPONSE:
               {
