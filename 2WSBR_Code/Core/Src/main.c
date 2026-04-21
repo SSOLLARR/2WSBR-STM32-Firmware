@@ -2,10 +2,27 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
+  * @brief          : Hybrid cascade-control starting point
+  *                   - keeps the clean dissertation-friendly structure
+  *                   - keeps the useful parts of the Gemini draft
+  *
+  * Control structure:
+  *   Outer loop : pitch angle theta_hat  -> q_ref
+  *   Inner loop : pitch rate  gyro_rate  -> motor pulse rate (PPS)
+  *
+  * Notes:
+  *   1) This is NOT a true wheel-velocity inner loop, because the current robot
+  *      has IMU feedback and STEP/DIR stepper actuation but no measured wheel
+  *      speed feedback.
+  *   2) The pseudo-velocity supervisor from the Gemini draft has deliberately
+  *      been removed, because it used filtered control effort as if it were a
+  *      plant measurement. That is bad for black-box identification.
+  *   3) An optional Gemini-style nonlinear outer-loop gain punch is retained,
+  *      but set conservatively so it can be turned on later if needed.
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
@@ -14,92 +31,110 @@
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
-#include <stdlib.h>
-
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* MPU6050 Configuration */
-#define MPU6050_ADDR       (0x68 << 1)
-#define WHO_AM_I_REG       0x75
-#define PWR_MGMT_1_REG     0x6B
-#define ACCEL_XOUT_H_REG   0x3B
+/* MPU6050 registers */
+#define MPU6050_ADDR         (0x68 << 1)
+#define WHO_AM_I_REG         0x75
+#define PWR_MGMT_1_REG       0x6B
+#define CONFIG_REG           0x1A
+#define GYRO_CONFIG_REG      0x1B
+#define ACCEL_CONFIG_REG     0x1C
+#define ACCEL_XOUT_H_REG     0x3B
 
-/* Operational Modes */
-#define MODE_BALANCING      0
-#define MODE_STEP_RESPONSE  1
-#define MODE_SWEEP          2
-#define MODE_FALL_TEST      3
+/* Modes */
+#define MODE_BALANCING       0
+#define MODE_RATE_STEP       1   /* closed-loop inner-loop excitation */
+#define MODE_MOTOR_STEP      2   /* open-loop motor excitation for ID */
+#define MODE_FALL_TEST       3
 
-/* Filter & Control Constants */
-#define ALPHA           0.975f   // Optimized to prevent scale-factor drift leaning
-#define DT              0.005f
-#define RAD_TO_DEG      57.29577951f
-#define ACCEL_SCALE     16384.0f
-#define GYRO_SCALE      131.0f
-#define DIVIDER_RATIO   6.0f
+/* Scaling */
+#define RAD_TO_DEG           57.29577951f
+#define GYRO_SCALE           131.0f
+#define DIVIDER_RATIO        6.0f
+
+/* Complementary filter */
+#define CF_ALPHA             0.975f
+
+/* Angle-loop limits */
+#define THETA_REF_DEFAULT_DEG    0.0f
+#define THETA_TRIM_DEFAULT_DEG   0.0f
+#define Q_REF_LIMIT_DPS          120.0f
+
+/* Motor / actuation limits */
+#define MOTOR_CMD_LIMIT_PPS      3500.0f
+#define MOTOR_MIN_PPS            15.5f
+#define MOTOR_KICK_PPS           200.0f
+#define MOTOR_SLEW_PPS_PER_S     30000.0f
+#define MOTOR_SIGN               -1.0f   /* flip to -1.0f if the polarity is wrong */
+
+/* Safety */
+#define SAFE_ANGLE_LIMIT_DEG     8.0f
+#define FALL_TIME_LIMIT_MS       1500U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-
 /* USER CODE BEGIN PV */
-/* Sensor Data Buffers */
+/* Raw IMU buffer */
 uint8_t rx_data[14];
 int16_t raw_acc_x, raw_acc_y, raw_acc_z;
 int16_t raw_gyro_x, raw_gyro_y, raw_gyro_z;
-float estimated_pitch = 0.0f;
-static float gyro_bias_x = 0.0f;
-static float pitch_zero  = 0.0f;
 
-/* Inner Loop: Pitch PID Parameters */
-float Kp = 800.0f;
-float Ki = 2.5f;
-float Kd = 1000.0f;
+/* Sensor / estimated states */
+float acc_pitch_deg = 0.0f;
+float gyro_rate_dps = 0.0f;
+float estimated_pitch_deg = 0.0f;
+static float gyro_bias_x_dps = 0.0f;
+static float pitch_zero_deg  = 0.0f;
 
-float pid_error = 0.0f;
-float previous_error = 0.0f;
-float pid_integral = 0.0f;
-float pid_output = 0.0f;
+/* Outer loop: theta -> q_ref */
+float angle_Kp         = 7.0f;
+float angle_Ki         = 2.00f;
+float angle_aggression = 0.00f;
+float angle_integral   = 0.0f;
+float theta_ref_deg    = THETA_REF_DEFAULT_DEG;
+float theta_trim_deg   = THETA_TRIM_DEFAULT_DEG;
+float q_ref_dps        = 0.0f;
 
-/* Outer Loop: Velocity Control Parameters */
-float target_angle = 0.0f;
-float speed_integral = 0.0f;
-float speed_Kp = 0.0001f;
-float speed_Ki = 0.0004f;
-static float chassis_velocity = 0.0f; // Low-pass filtered motor output
+/* Inner loop: q -> motor PPS */
+float rate_Kp       = 37.0f;
+float rate_Ki       = 15.0f;
+float rate_integral = 0.0f;
+float motor_cmd_pps = 0.0f;  /* controller output before actuator shaping */
+float motor_applied_pps = 0.0f; /* actual post-limit / post-slew plant input */
+static float motor_slewed_pps = 0.0f;
 
-/* Fall Detection States */
-#define SAFE_ANGLE_LIMIT    8.0f   // Degrees: Beyond this, we consider it a fall
-#define FALL_TIME_LIMIT_MS  1500   // 1.5 seconds
+/* Mode and test signals */
+int test_mode = MODE_BALANCING;
+uint32_t test_timer = 0;
+float test_rate_ref_dps = 0.0f;
+float test_motor_pps    = 0.0f;
+
+/* Fall detection */
 uint32_t fall_timer_ms = 0;
 uint8_t  is_falling = 0;
 
-
-/* System States */
+/* Battery / comms / timing */
 float battery_voltage = 0.0f;
-float current_speed = 0.0f;
-int test_mode = MODE_BALANCING;
-uint32_t test_timer = 0;
-float test_speed = 0.0f;
-
+HAL_StatusTypeDef i2c_status;
 static volatile uint8_t uart_tx_busy = 0;
-uint16_t telemetry_counter = 0;
 uint16_t loop_exec_time_us = 0;
 uint16_t loop_period_us = 0;
 uint16_t last_loop_stamp_us = 0;
@@ -108,36 +143,100 @@ uint16_t last_loop_stamp_us = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static float clampf(float x, float lo, float hi);
+static void reset_controllers(void);
+static void motor_outputs_enable(void);
+static void motor_outputs_disable(void);
+static void MPU6050_WriteReg(uint8_t reg, uint8_t value);
+static uint8_t MPU6050_ReadReg(uint8_t reg);
+static void MPU6050_Init(void);
+static void MPU6050_Read(void);
+static void IMU_CalibrateAtRest(void);
+static float update_complementary_filter(float acc_pitch, float gyro_rate, float dt);
+static float angle_outer_loop(float theta_ref, float theta_hat, float dt);
+static float rate_inner_loop(float q_ref, float q_hat, float dt);
+static void set_motor_speed(float target_speed_pps, float dt);
+static void process_bluetooth_command(const char *cmd);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-void MPU6050_Init(void)
+static float clampf(float x, float lo, float hi)
 {
-    uint8_t data = 0x00;
-    HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, PWR_MGMT_1_REG, 1, &data, 1, 1000);
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
 }
 
-HAL_StatusTypeDef i2c_status;
+static void reset_controllers(void)
+{
+    angle_integral = 0.0f;
+    rate_integral  = 0.0f;
+    q_ref_dps      = 0.0f;
+    motor_cmd_pps  = 0.0f;
+}
 
-void MPU6050_Read(void)
+static void motor_outputs_enable(void)
+{
+    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
+}
+
+static void motor_outputs_disable(void)
+{
+    htim1.Instance->CCR1 = 0;
+    htim4.Instance->CCR1 = 0;
+    HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
+    motor_applied_pps = 0.0f;
+    motor_slewed_pps  = 0.0f;
+}
+
+static void MPU6050_WriteReg(uint8_t reg, uint8_t value)
+{
+    HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, reg, 1, &value, 1, 100);
+}
+
+static uint8_t MPU6050_ReadReg(uint8_t reg)
+{
+    uint8_t value = 0;
+    HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, reg, 1, &value, 1, 100);
+    return value;
+}
+
+static void MPU6050_Init(void)
+{
+    /* Wake sensor */
+    MPU6050_WriteReg(PWR_MGMT_1_REG, 0x00);
+    HAL_Delay(50);
+
+    /* Enable DLPF -> gyro bandwidth about 42 Hz */
+    MPU6050_WriteReg(CONFIG_REG, 0x03);
+
+    /* Gyro = ±250 dps, accel = ±2g */
+    MPU6050_WriteReg(GYRO_CONFIG_REG, 0x00);
+    MPU6050_WriteReg(ACCEL_CONFIG_REG, 0x00);
+
+    (void)MPU6050_ReadReg(WHO_AM_I_REG);
+}
+
+static void MPU6050_Read(void)
 {
     i2c_status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H_REG, 1, rx_data, 14, 2);
 
-    if (i2c_status == HAL_OK) {
-        raw_acc_x  = (int16_t)(rx_data[0]  << 8 | rx_data[1]);
-        raw_acc_y  = (int16_t)(rx_data[2]  << 8 | rx_data[3]);
-        raw_acc_z  = (int16_t)(rx_data[4]  << 8 | rx_data[5]);
+    if (i2c_status == HAL_OK)
+    {
+        raw_acc_x  = (int16_t)((rx_data[0]  << 8) | rx_data[1]);
+        raw_acc_y  = (int16_t)((rx_data[2]  << 8) | rx_data[3]);
+        raw_acc_z  = (int16_t)((rx_data[4]  << 8) | rx_data[5]);
 
-        raw_gyro_x = (int16_t)(rx_data[8]  << 8 | rx_data[9]);
-        raw_gyro_y = (int16_t)(rx_data[10] << 8 | rx_data[11]);
-        raw_gyro_z = (int16_t)(rx_data[12] << 8 | rx_data[13]);
-    } else {
-        /* Kill motor outputs on sensor failure */
-        htim1.Instance->CCR1 = 0;
-        htim4.Instance->CCR1 = 0;
+        raw_gyro_x = (int16_t)((rx_data[8]  << 8) | rx_data[9]);
+        raw_gyro_y = (int16_t)((rx_data[10] << 8) | rx_data[11]);
+        raw_gyro_z = (int16_t)((rx_data[12] << 8) | rx_data[13]);
+    }
+    else
+    {
+        motor_outputs_disable();
     }
 }
 
@@ -152,117 +251,246 @@ static void IMU_CalibrateAtRest(void)
         MPU6050_Read();
         gyro_sum += -((float)raw_gyro_x / GYRO_SCALE);
         acc_sum  += -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG);
-        HAL_Delay(2); // Wait 2ms between reads
+        HAL_Delay(2);
     }
 
-    gyro_bias_x = gyro_sum / N;
-    pitch_zero  = acc_sum / N;
-
-    /* The controller now sees this exact resting position as 0.0 degrees */
-    estimated_pitch = 0.0f;
+    gyro_bias_x_dps = gyro_sum / (float)N;
+    pitch_zero_deg  = acc_sum / (float)N;
+    estimated_pitch_deg = 0.0f;
 }
 
-float update_complementary_filter(float acc_pitch, float gyro_rate, float dynamic_dt)
+static float update_complementary_filter(float acc_pitch, float gyro_rate, float dt)
 {
-    estimated_pitch = ALPHA * (estimated_pitch + gyro_rate * dynamic_dt) + (1.0f - ALPHA) * acc_pitch;
-    return estimated_pitch;
+    estimated_pitch_deg = (CF_ALPHA * (estimated_pitch_deg + gyro_rate * dt))
+                        + ((1.0f - CF_ALPHA) * acc_pitch);
+    return estimated_pitch_deg;
 }
 
-float calculate_PID(float current_pitch, float gyro_rate, float dynamic_dt)
+static float angle_outer_loop(float theta_ref, float theta_hat, float dt)
 {
-    pid_error = current_pitch - target_angle;
+    const float theta_err = theta_ref - theta_hat;
+    const float dynamic_Kp = angle_Kp + (angle_aggression * fabsf(theta_err));
+    float unsat_q_ref;
+    float sat_q_ref;
 
-    /* --- NON-LINEAR PROPORTIONAL TERM --- */
-    // As error grows, Kp grows exponentially to violently catch dives
-    float aggression_multiplier = 150.0f;
-    float dynamic_Kp = Kp + (fabs(pid_error) * aggression_multiplier);
+    /* Integrate only near the operating region */
+    if (fabsf(theta_err) < 6.0f)
+    {
+        angle_integral += theta_err * dt;
+        angle_integral = clampf(angle_integral, -40.0f, 40.0f);
+    }
+    else
+    {
+        angle_integral *= 0.98f;
+    }
 
-    float P_out = dynamic_Kp * pid_error;
+    unsat_q_ref = (dynamic_Kp * theta_err) + (angle_Ki * angle_integral);
+    sat_q_ref   = clampf(unsat_q_ref, -Q_REF_LIMIT_DPS, Q_REF_LIMIT_DPS);
 
-    /* 1. Integral */
-    pid_integral += pid_error * dynamic_dt;
-    if (pid_integral > 400.0f)  pid_integral = 400.0f;
-    if (pid_integral < -400.0f) pid_integral = -400.0f;
-    float I_out = Ki * pid_integral;
+    /* Simple anti-windup backout */
+    if (unsat_q_ref != sat_q_ref)
+    {
+        angle_integral *= 0.995f;
+    }
 
-    /* 2. Derivative */
-    static float D_filtered = 0.0f;
-    float D_raw = Kd * gyro_rate;
-    const float beta = 0.4f;
-    D_filtered = (beta * D_filtered) + ((1.0f - beta) * D_raw);
-
-    pid_output = P_out + I_out + D_filtered;
-    return pid_output;
+    return sat_q_ref;
 }
-void set_motor_speed(float target_speed)
+
+static float rate_inner_loop(float q_ref, float q_hat, float dt)
 {
-    if (isnan(target_speed) || isinf(target_speed)) {
+    const float q_err = q_ref - q_hat;
+    float unsat_u;
+    float sat_u;
+
+    rate_integral += q_err * dt;
+    rate_integral = clampf(rate_integral, -600.0f, 600.0f);
+
+    unsat_u = (rate_Kp * q_err) + (rate_Ki * rate_integral);
+    sat_u   = clampf(unsat_u, -MOTOR_CMD_LIMIT_PPS, MOTOR_CMD_LIMIT_PPS);
+
+    if (unsat_u != sat_u)
+    {
+        rate_integral *= 0.995f;
+    }
+
+    return sat_u;
+}
+
+static void set_motor_speed(float target_speed_pps, float dt)
+{
+    float max_delta_pps;
+    float applied;
+    uint32_t timer_arr;
+
+    if (isnan(target_speed_pps) || isinf(target_speed_pps))
+    {
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
+        motor_applied_pps = 0.0f;
         return;
     }
 
-    float compensated_speed = target_speed;
+    target_speed_pps = clampf(target_speed_pps, -MOTOR_CMD_LIMIT_PPS, MOTOR_CMD_LIMIT_PPS);
+    max_delta_pps = MOTOR_SLEW_PPS_PER_S * dt;
 
-    /* Clamp absolute limits */
-    if (compensated_speed > 5000.0f)  compensated_speed = 5000.0f;
-    if (compensated_speed < -5000.0f) compensated_speed = -5000.0f;
-
-    /* --- 1. SLEW RATE LIMITER --- */
-    static float slewed_speed = 0.0f;
-    float max_change_per_loop = 150.0f;
-    float instant_kick_speed  = 200.0f;
-
-    if (slewed_speed == 0.0f && compensated_speed > instant_kick_speed) {
-        slewed_speed = instant_kick_speed;
-    } else if (slewed_speed == 0.0f && compensated_speed < -instant_kick_speed) {
-        slewed_speed = -instant_kick_speed;
-    } else {
-        if (compensated_speed > slewed_speed + max_change_per_loop) {
-            slewed_speed += max_change_per_loop;
-        } else if (compensated_speed < slewed_speed - max_change_per_loop) {
-            slewed_speed -= max_change_per_loop;
-        } else {
-            slewed_speed = compensated_speed;
+    /* Software ramping is essential for steppers */
+    if ((motor_slewed_pps == 0.0f) && (target_speed_pps > MOTOR_KICK_PPS))
+    {
+        motor_slewed_pps = MOTOR_KICK_PPS;
+    }
+    else if ((motor_slewed_pps == 0.0f) && (target_speed_pps < -MOTOR_KICK_PPS))
+    {
+        motor_slewed_pps = -MOTOR_KICK_PPS;
+    }
+    else
+    {
+        if (target_speed_pps > motor_slewed_pps + max_delta_pps)
+        {
+            motor_slewed_pps += max_delta_pps;
+        }
+        else if (target_speed_pps < motor_slewed_pps - max_delta_pps)
+        {
+            motor_slewed_pps -= max_delta_pps;
+        }
+        else
+        {
+            motor_slewed_pps = target_speed_pps;
         }
     }
 
-    float applied_speed = slewed_speed;
+    motor_applied_pps = motor_slewed_pps;
+    applied = MOTOR_SIGN * motor_slewed_pps;
 
-    /* --- 2. DIRECTION & HARDWARE TIMERS --- */
-    if (applied_speed >= 0) {
+    if (applied >= 0.0f)
+    {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_RESET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_SET);
-    } else {
+    }
+    else
+    {
         HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
         HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
-        applied_speed = -applied_speed; // Absolute value for timer calculation
+        applied = -applied;
     }
 
-    /* --- 3. CRITICAL 16-BIT TIMER CUTOFF ---
-       The 16-bit timer physically CANNOT step slower than 15.26 Hz.
-       We cut power cleanly below 15.5 Hz to allow the robot to stand still
-       and mathematically prevent an 884 Hz integer overflow spike. */
-    if (applied_speed < 15.5f) {
+    if (applied < MOTOR_MIN_PPS)
+    {
         htim1.Instance->CCR1 = 0;
         htim4.Instance->CCR1 = 0;
+        motor_applied_pps = 0.0f;
         return;
     }
 
-    uint32_t timer_arr = (uint32_t)(1000000.0f / applied_speed) - 1;
-
-    // Failsafe Guard against any residual overflows
-    if (timer_arr > 65535) {
-        timer_arr = 65535;
+    timer_arr = (uint32_t)(1000000.0f / applied) - 1U;
+    if (timer_arr > 65535U)
+    {
+        timer_arr = 65535U;
     }
 
     __disable_irq();
     htim1.Instance->ARR  = timer_arr;
-    htim1.Instance->CCR1 = timer_arr / 2;
-
+    htim1.Instance->CCR1 = timer_arr / 2U;
     htim4.Instance->ARR  = timer_arr;
-    htim4.Instance->CCR1 = timer_arr / 2;
+    htim4.Instance->CCR1 = timer_arr / 2U;
     __enable_irq();
+}
+
+static void process_bluetooth_command(const char *cmd)
+{
+    /* Explicit two-letter commands */
+    if (strncmp(cmd, "OP", 2) == 0)
+    {
+        angle_Kp = atof(&cmd[2]);
+        angle_integral = 0.0f;
+    }
+    else if (strncmp(cmd, "OI", 2) == 0)
+    {
+        angle_Ki = atof(&cmd[2]);
+        angle_integral = 0.0f;
+    }
+    else if (strncmp(cmd, "OG", 2) == 0)
+    {
+        angle_aggression = atof(&cmd[2]);
+    }
+    else if (strncmp(cmd, "IP", 2) == 0)
+    {
+        rate_Kp = atof(&cmd[2]);
+        rate_integral = 0.0f;
+    }
+    else if (strncmp(cmd, "II", 2) == 0)
+    {
+        rate_Ki = atof(&cmd[2]);
+        rate_integral = 0.0f;
+    }
+    else if (strncmp(cmd, "RE", 2) == 0)
+    {
+        theta_ref_deg = atof(&cmd[2]);
+    }
+    else if (strncmp(cmd, "TR", 2) == 0)
+    {
+        theta_trim_deg = atof(&cmd[2]);
+    }
+    else if (strncmp(cmd, "MO", 2) == 0)
+    {
+        int requested_mode = atoi(&cmd[2]);
+        if ((requested_mode >= MODE_BALANCING) && (requested_mode <= MODE_FALL_TEST))
+        {
+            test_mode = requested_mode;
+            test_timer = 0U;
+            reset_controllers();
+        }
+    }
+    else if (strcmp(cmd, "ZE") == 0)
+    {
+        reset_controllers();
+    }
+
+    else if (cmd[0] == 'P')
+    {
+        angle_Kp = atof(&cmd[1]);
+        angle_integral = 0.0f;
+    }
+    else if (cmd[0] == 'I')
+    {
+        angle_Ki = atof(&cmd[1]);
+        angle_integral = 0.0f;
+    }
+    else if (cmd[0] == 'A')
+    {
+        angle_aggression = atof(&cmd[1]);
+    }
+    else if (cmd[0] == 'p')
+    {
+        rate_Kp = atof(&cmd[1]);
+        rate_integral = 0.0f;
+    }
+    else if (cmd[0] == 'i')
+    {
+        rate_Ki = atof(&cmd[1]);
+        rate_integral = 0.0f;
+    }
+    else if (cmd[0] == 'R')
+    {
+        theta_ref_deg = atof(&cmd[1]);
+    }
+    else if (cmd[0] == 'T')
+    {
+        theta_trim_deg = atof(&cmd[1]);
+    }
+    else if (cmd[0] == 'M')
+    {
+        int requested_mode = atoi(&cmd[1]);
+        if ((requested_mode >= MODE_BALANCING) && (requested_mode <= MODE_FALL_TEST))
+        {
+            test_mode = requested_mode;
+            test_timer = 0U;
+            reset_controllers();
+        }
+    }
+    else if (cmd[0] == 'Z')
+    {
+        reset_controllers();
+    }
 }
 /* USER CODE END 0 */
 
@@ -272,26 +500,12 @@ void set_motor_speed(float target_speed)
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
@@ -313,13 +527,12 @@ int main(void)
   MPU6050_Init();
   IMU_CalibrateAtRest();
 
-  /* Initialize Motor Driver Pins */
+  /* Default motor direction */
   HAL_GPIO_WritePin(DIR_L_GPIO_Port, DIR_L_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(DIR_R_GPIO_Port, DIR_R_Pin, GPIO_PIN_RESET);
 
-  /* Default enable state at boot */
-  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
+  /* Enable drivers by default */
+  motor_outputs_enable();
 
   /* Enable shadow registers */
   htim1.Instance->CR1 |= TIM_CR1_ARPE;
@@ -332,11 +545,9 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
 
-  // Telemetry Priority
-  static uint8_t batt_div = 0;   // every 10 loops = 50 ms
+  static uint8_t batt_div = 0;
   static char bt_cmd_buf[32];
   static uint8_t bt_cmd_idx = 0;
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -346,216 +557,196 @@ int main(void)
       uint16_t now = __HAL_TIM_GET_COUNTER(&htim6);
       uint16_t elapsed = (uint16_t)(now - last_loop_stamp_us);
 
-      if (elapsed >= 5000)   // 5 ms loop
+      if (elapsed >= 5000U)
       {
+          const float dt = elapsed * 1.0e-6f;
+          const float theta_command_deg = theta_ref_deg + theta_trim_deg;
+          uint16_t exec_start_us;
+
           loop_period_us = elapsed;
           last_loop_stamp_us = now;
+          exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
 
-          uint16_t exec_start_us = __HAL_TIM_GET_COUNTER(&htim6);
-
-          /* --- Battery ADC --- */
+          /* Battery ADC */
           HAL_ADC_Start(&hadc2);
           if (HAL_ADC_PollForConversion(&hadc2, 10) == HAL_OK)
           {
-              uint32_t raw_adc = HAL_ADC_GetValue(&hadc2);
+              const uint32_t raw_adc = HAL_ADC_GetValue(&hadc2);
               battery_voltage = ((float)raw_adc / 4095.0f) * 3.3f * DIVIDER_RATIO;
           }
           HAL_ADC_Stop(&hadc2);
 
-          /* --- IMU Read --- */
-	      MPU6050_Read();
+          /* IMU */
+          MPU6050_Read();
+          acc_pitch_deg = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG) - pitch_zero_deg;
+          gyro_rate_dps = -((float)raw_gyro_x / GYRO_SCALE) - gyro_bias_x_dps;
+          update_complementary_filter(acc_pitch_deg, gyro_rate_dps, dt);
 
-          // Calculate dynamic dt based on the actual hardware timer
-          float dynamic_dt = loop_period_us * 1e-6f;
+          /* Fall detection */
+          if (fabsf(estimated_pitch_deg) > SAFE_ANGLE_LIMIT_DEG)
+          {
+              fall_timer_ms += (uint32_t)(dt * 1000.0f);
+              if (fall_timer_ms >= FALL_TIME_LIMIT_MS)
+              {
+                  is_falling = 1U;
+              }
+          }
+          else
+          {
+              fall_timer_ms = 0U;
+              is_falling = 0U;
+          }
 
-          // Subtract the offsets calculated during startup
-          float acc_pitch = -(atan2f((float)raw_acc_y, (float)raw_acc_z) * RAD_TO_DEG) - pitch_zero;
-          float gyro_rate = -((float)raw_gyro_x / GYRO_SCALE) - gyro_bias_x;
-
-          /* --- Sensor Fusion --- */
-          update_complementary_filter(acc_pitch, gyro_rate, dynamic_dt);
-
-          /* --- Mode Handling --- */
           switch (test_mode)
           {
-          case MODE_BALANCING:
-                        {
-                            /* --- FALL DETECTION LOGIC --- */
-                            // If the robot leans past the safe limit, start the timer
-                            if (fabs(estimated_pitch) > SAFE_ANGLE_LIMIT) {
-                                fall_timer_ms += (uint32_t)(dynamic_dt * 1000.0f); // Add ~5ms
-                            } else {
-                                // If it recovers into the safe zone, reset the timer
-                                fall_timer_ms = 0;
-                                is_falling = 0;
-                            }
-
-                            // If it has been falling for longer than the limit, trigger the failsafe
-                            if (fall_timer_ms >= FALL_TIME_LIMIT_MS) {
-                                is_falling = 1;
-                            }
-
-                            /* --- BEHAVIOR --- */
-                            if (is_falling == 1) {
-                                // EMERGENCY STATE: Arrest the dive or kill power
-
-                                // Option A: Kill Power (Drop to the floor safely)
-                                pid_output = 0.0f;
-                                htim1.Instance->CCR1 = 0;
-                                htim4.Instance->CCR1 = 0;
-                                HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
-                                HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
-
-                                // (Optional) Automatically reset to balancing mode if you pick it back up
-                                // if (fabs(estimated_pitch) < 1.0f) {
-                                //     fall_timer_ms = 0;
-                                //     is_falling = 0;
-                                //     // Reset integral accumulators so it doesn't instantly jump
-                                //     pid_integral = 0;
-                                //     speed_integral = 0;
-                                // }
-
-                            } else {
-                                // NORMAL BALANCING STATE
-                                HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-                                HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
-
-                                /* --- 1. OUTER LOOP: Velocity Cascade Control --- */
-                                chassis_velocity = (0.85f * chassis_velocity) + (0.15f * pid_output);
-
-                                float target_speed = 0.0f;
-                                float speed_error = target_speed - chassis_velocity;
-
-                                speed_integral += speed_error * dynamic_dt;
-
-                                if (speed_integral > 8000.0f)  speed_integral = 8000.0f;
-                                if (speed_integral < -8000.0f) speed_integral = -8000.0f;
-
-                                target_angle = (speed_error * speed_Kp) + (speed_integral * speed_Ki);
-
-                                // Outer loop authority clamp
-                                if (target_angle > 1.7f)  target_angle = 1.7f;
-                                if (target_angle < -1.7f) target_angle = -1.7f;
-
-                                /* --- 2. INNER LOOP: Pitch Control --- */
-                                calculate_PID(estimated_pitch, gyro_rate, dynamic_dt);
-                                set_motor_speed(pid_output);
-                            }
-                            break;
-                        }
-
-              case MODE_STEP_RESPONSE:
+              case MODE_BALANCING:
               {
-                  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_RESET);
-                  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_RESET);
-
-                  test_timer++;
-                  if (test_timer < 100)          test_speed = 0.0f;
-                  else if (test_timer < 1000)    test_speed += 5.0f;
+                  if (is_falling)
+                  {
+                      motor_outputs_disable();
+                      reset_controllers();
+                  }
                   else
                   {
-                      test_speed = 0.0f;
-                      test_timer = 0;
+                      motor_outputs_enable();
+                      q_ref_dps = angle_outer_loop(theta_command_deg, estimated_pitch_deg, dt);
+                      motor_cmd_pps = rate_inner_loop(q_ref_dps, gyro_rate_dps, dt);
+                      set_motor_speed(motor_cmd_pps, dt);
+                  }
+                  break;
+              }
+
+              case MODE_RATE_STEP:
+              {
+                  /* Closed-loop inner-loop identification via q_ref step */
+                  motor_outputs_enable();
+                  test_timer++;
+
+                  if (test_timer < 200U)         test_rate_ref_dps = 0.0f;
+                  else if (test_timer < 600U)    test_rate_ref_dps = 35.0f;
+                  else if (test_timer < 1000U)   test_rate_ref_dps = -35.0f;
+                  else
+                  {
+                      test_timer = 0U;
+                      test_rate_ref_dps = 0.0f;
                   }
 
-                  set_motor_speed(test_speed);
-                  pid_output = test_speed;
+                  q_ref_dps = clampf(test_rate_ref_dps, -Q_REF_LIMIT_DPS, Q_REF_LIMIT_DPS);
+                  motor_cmd_pps = rate_inner_loop(q_ref_dps, gyro_rate_dps, dt);
+                  set_motor_speed(motor_cmd_pps, dt);
+                  break;
+              }
+
+              case MODE_MOTOR_STEP:
+              {
+                  /* Open-loop single step for plant identification.
+                     Phase 1 (0-499ms): motors off, robot settles upright.
+                     Phase 2 (500ms+):  fixed step, holds until you catch it.
+                     Power cycle to repeat. */
+                  motor_outputs_enable();
+                  reset_controllers();
+                  test_timer++;
+
+                  if (test_timer < 100U)
+                  {
+                      /* Phase 1: settle */
+                      test_motor_pps = 0.0f;
+                  }
+                  else
+                  {
+                      /* Phase 2: step and hold */
+                      test_motor_pps = 450.0f;
+                  }
+
+                  q_ref_dps     = 0.0f;
+                  motor_cmd_pps = test_motor_pps;
+                  set_motor_speed(motor_cmd_pps, dt);
                   break;
               }
 
               case MODE_FALL_TEST:
+              default:
               {
-                  pid_output = 0.0f;
-                  htim1.Instance->CCR1 = 0;
-                  htim4.Instance->CCR1 = 0;
-                  HAL_GPIO_WritePin(EN_L_GPIO_Port, EN_L_Pin, GPIO_PIN_SET);
-                  HAL_GPIO_WritePin(EN_R_GPIO_Port, EN_R_Pin, GPIO_PIN_SET);
+                  motor_outputs_disable();
+                  reset_controllers();
                   break;
               }
-
-              default:
-                  break;
           }
 
           loop_exec_time_us = (uint16_t)(__HAL_TIM_GET_COUNTER(&htim6) - exec_start_us);
 
           /* =========================================================
-             USB / MATLAB telemetry on USART2 @ 460800
+             USART2 telemetry for MATLAB
+             A packet every 5 ms:
+             A,acc_pitch,gyro_rate,theta_hat,theta_cmd,q_ref,u_cmd,u_applied,mode
              ========================================================= */
-
-          /* A packet: every 5 ms (critical) */
           {
-              char usbA[64];
-              int len = snprintf(usbA, sizeof(usbA),
-                                 "A,%.3f,%.3f,%.3f,%.3f\n",
-                                 acc_pitch, gyro_rate, estimated_pitch, pid_output);
+              char usbA[160];
+              const int len = snprintf(usbA, sizeof(usbA),
+                                       "A,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+                                       acc_pitch_deg,
+                                       gyro_rate_dps,
+                                       estimated_pitch_deg,
+                                       theta_command_deg,
+                                       q_ref_dps,
+                                       motor_cmd_pps,
+                                       motor_applied_pps,
+                                       test_mode);
               if (len > 0)
               {
-                  HAL_UART_Transmit(&huart2, (uint8_t *)usbA, len, 2);
+                  HAL_UART_Transmit(&huart2, (uint8_t *)usbA, (uint16_t)len, 2);
               }
           }
 
-          /* B packet: every 5 ms (timing) */
           {
-              char usbB[32];
-              int len = snprintf(usbB, sizeof(usbB),
-                                 "B,%u,%u\n",
-                                 loop_period_us, loop_exec_time_us);
+              char usbB[48];
+              const int len = snprintf(usbB, sizeof(usbB),
+                                       "B,%u,%u\n",
+                                       loop_period_us,
+                                       loop_exec_time_us);
               if (len > 0)
               {
-                  HAL_UART_Transmit(&huart2, (uint8_t *)usbB, len, 2);
+                  HAL_UART_Transmit(&huart2, (uint8_t *)usbB, (uint16_t)len, 2);
               }
           }
 
-          /* C packet: every 50 ms (battery) */
-          if (++batt_div >= 10)
+          if (++batt_div >= 10U)
           {
-              batt_div = 0;
-
-              char usbC[20];
-              int len = snprintf(usbC, sizeof(usbC),
-                                 "C,%.2f\n",
-                                 battery_voltage);
+              batt_div = 0U;
+              char usbC[48];
+              const int len = snprintf(usbC, sizeof(usbC),
+                                       "C,%.2f,%u,%u\n",
+                                       battery_voltage,
+                                       fall_timer_ms,
+                                       (unsigned)is_falling);
               if (len > 0)
               {
-                  HAL_UART_Transmit(&huart2, (uint8_t *)usbC, len, 2);
+                  HAL_UART_Transmit(&huart2, (uint8_t *)usbC, (uint16_t)len, 2);
               }
           }
 
-          /* =========================================================
-             USART1 (Bluetooth Tuning)
-             ========================================================= */
-
-          uint8_t ch;
-
-          /* Drain ALL available characters from the UART RX register */
-          while (HAL_UART_Receive(&huart1, &ch, 1, 0) == HAL_OK)
+          /* Bluetooth commands on USART1 */
           {
-              if (ch == '\n' || ch == '\r')
+              uint8_t ch;
+              while (HAL_UART_Receive(&huart1, &ch, 1, 0) == HAL_OK)
               {
-                  bt_cmd_buf[bt_cmd_idx] = '\0'; // Null terminate
-
-                  if (bt_cmd_buf[0] == 'P') {
-                      Kp = atof(&bt_cmd_buf[1]);
-                      pid_integral = 0.0f; // Reset integral to prevent violent jumps
+                  if ((ch == '\n') || (ch == '\r'))
+                  {
+                      bt_cmd_buf[bt_cmd_idx] = '\0';
+                      if (bt_cmd_idx > 0U)
+                      {
+                          process_bluetooth_command(bt_cmd_buf);
+                      }
+                      bt_cmd_idx = 0U;
                   }
-                  else if (bt_cmd_buf[0] == 'I') {
-                      Ki = atof(&bt_cmd_buf[1]);
-                      pid_integral = 0.0f;
+                  else if (bt_cmd_idx < (sizeof(bt_cmd_buf) - 1U))
+                  {
+                      bt_cmd_buf[bt_cmd_idx++] = (char)ch;
                   }
-                  else if (bt_cmd_buf[0] == 'D') {
-                      Kd = atof(&bt_cmd_buf[1]);
+                  else
+                  {
+                      bt_cmd_idx = 0U;
                   }
-
-                  bt_cmd_idx = 0; // Reset index for next command
-              }
-              else if (bt_cmd_idx < sizeof(bt_cmd_buf) - 1)
-              {
-                  bt_cmd_buf[bt_cmd_idx++] = (char)ch;
-              }
-              else
-              {
-                  bt_cmd_idx = 0; // Buffer overflow protection, reset
               }
           }
       }
@@ -575,13 +766,8 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -597,8 +783,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -615,7 +799,8 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == USART2) {
+    if (huart->Instance == USART2)
+    {
         uart_tx_busy = 0;
     }
 }
@@ -627,25 +812,16 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* USER CODE END 6 */
+  (void)file;
+  (void)line;
 }
 #endif /* USE_FULL_ASSERT */
