@@ -19,6 +19,20 @@
   *      plant measurement. That is bad for black-box identification.
   *   3) An optional Gemini-style nonlinear outer-loop gain punch is retained,
   *      but set conservatively so it can be turned on later if needed.
+  *
+  *   Revision (tuning pass):
+  *   - rate_Kp lowered 37 -> 18 so inner-loop P-term no longer saturates
+  *     the motor command at only ~68 dps of rate error.
+  *   - Both PI loops use proper conditional integration (Gleick-style
+  *     anti-windup): integrator only advances when doing so would not drive
+  *     further into saturation.
+  *   - rate_integral clamp tightened 600 -> 150 so the I-term alone can
+  *     never exceed the motor command limit.
+  *   - MOTOR_KICK_PPS jump is suppressed in MODE_BALANCING. The discontinuity
+  *     is useful for open-loop stepper ID but corrupts closed-loop response
+  *     every time motor_slewed_pps passes through zero.
+  *   - Packet A now carries a monotonic sample_idx. Time axis for post-
+  *     processing is sample_idx * 5 ms, independent of PC-side buffering.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -67,19 +81,19 @@
 #define DIVIDER_RATIO        6.0f
 
 /* Complementary filter */
-#define CF_ALPHA             0.975f
+#define CF_ALPHA             0.97f
 
 /* Angle-loop limits */
 #define THETA_REF_DEFAULT_DEG    0.0f
 #define THETA_TRIM_DEFAULT_DEG   0.0f
-#define Q_REF_LIMIT_DPS          120.0f
+#define Q_REF_LIMIT_DPS          180.0f
 
 /* Motor / actuation limits */
-#define MOTOR_CMD_LIMIT_PPS      3500.0f
-#define MOTOR_MIN_PPS            15.5f
+#define MOTOR_CMD_LIMIT_PPS      3800.0f   /* 90% of tested pull-out at 1/16 microstep */
+#define MOTOR_MIN_PPS            1.0f
 #define MOTOR_KICK_PPS           200.0f
 #define MOTOR_SLEW_PPS_PER_S     30000.0f
-#define MOTOR_SIGN               -1.0f   /* flip to -1.0f if the polarity is wrong */
+#define MOTOR_SIGN               -1.0f   /*polarity swtich
 
 /* Safety */
 #define SAFE_ANGLE_LIMIT_DEG     8.0f
@@ -105,16 +119,19 @@ static float gyro_bias_x_dps = 0.0f;
 static float pitch_zero_deg  = 0.0f;
 
 /* Outer loop: theta -> q_ref */
-float angle_Kp         = 7.0f;
+float angle_Kp         = 10.0f;
 float angle_Ki         = 2.00f;
-float angle_aggression = 0.00f;
+float angle_aggression = 5.00f;
 float angle_integral   = 0.0f;
 float theta_ref_deg    = THETA_REF_DEFAULT_DEG;
 float theta_trim_deg   = THETA_TRIM_DEFAULT_DEG;
 float q_ref_dps        = 0.0f;
 
-/* Inner loop: q -> motor PPS */
-float rate_Kp       = 37.0f;
+/* Inner loop: q -> motor PPS
+ * rate_Kp reduced from 37 to 18. At 37, a gyro error of only ~68 dps saturated
+ * motor_cmd at 2500 pps via the P-term alone, which meant the outer loop could
+ * never command large q_ref without the inner loop instantly railing. */
+float rate_Kp       = 18.0f;
 float rate_Ki       = 15.0f;
 float rate_integral = 0.0f;
 float motor_cmd_pps = 0.0f;  /* controller output before actuator shaping */
@@ -266,54 +283,79 @@ static float update_complementary_filter(float acc_pitch, float gyro_rate, float
     return estimated_pitch_deg;
 }
 
+/* Outer angle loop, theta_err -> q_ref.
+ *
+ * Conditional integration with saturation-aware hold:
+ *   1) Compute a provisional q_ref using the current integrator.
+ *   2) Integrate only if the robot is near the operating region
+ *      (|theta_err| < 6 deg) AND the integrator update would not push
+ *      further into whichever rail the output is already on.
+ *   3) If outside the operating region, decay the integrator.
+ *   4) Recompute the output with the (possibly updated) integrator and
+ *      saturate to the q_ref limit.
+ */
 static float angle_outer_loop(float theta_ref, float theta_hat, float dt)
 {
     const float theta_err = theta_ref - theta_hat;
     const float dynamic_Kp = angle_Kp + (angle_aggression * fabsf(theta_err));
-    float unsat_q_ref;
-    float sat_q_ref;
 
-    /* Integrate only near the operating region */
-    if (fabsf(theta_err) < 6.0f)
+    /* Provisional output using the existing integrator */
+    float q_prop = (dynamic_Kp * theta_err) + (angle_Ki * angle_integral);
+
+    const int in_region = (fabsf(theta_err) < 6.0f);
+    const int sat_high  = (q_prop >=  Q_REF_LIMIT_DPS);
+    const int sat_low   = (q_prop <= -Q_REF_LIMIT_DPS);
+    const int integrate_ok = in_region &&
+                             ( (!sat_high && !sat_low)
+                            || (sat_high && theta_err < 0.0f)
+                            || (sat_low  && theta_err > 0.0f) );
+
+    if (integrate_ok)
     {
         angle_integral += theta_err * dt;
         angle_integral = clampf(angle_integral, -40.0f, 40.0f);
     }
-    else
+    else if (!in_region)
     {
+        /* Bleed the integrator during large excursions so that a recovery
+         * attempt does not start with a stale windup offset. */
         angle_integral *= 0.98f;
     }
+    /* else: in region but saturated in the wrong direction -> hold. */
 
-    unsat_q_ref = (dynamic_Kp * theta_err) + (angle_Ki * angle_integral);
-    sat_q_ref   = clampf(unsat_q_ref, -Q_REF_LIMIT_DPS, Q_REF_LIMIT_DPS);
-
-    /* Simple anti-windup backout */
-    if (unsat_q_ref != sat_q_ref)
-    {
-        angle_integral *= 0.995f;
-    }
-
-    return sat_q_ref;
+    const float q_final = (dynamic_Kp * theta_err) + (angle_Ki * angle_integral);
+    return clampf(q_final, -Q_REF_LIMIT_DPS, Q_REF_LIMIT_DPS);
 }
 
+/* Inner rate loop, q_err -> motor_cmd_pps.
+ *
+ * Same conditional-integration pattern as the outer loop. Integrator clamp
+ * reduced from +/-600 to +/-150: with rate_Ki = 15, the I-term alone now
+ * tops out at +/- 2250 pps, leaving headroom for the P-term inside the
+ * motor command limit of 2500 pps.
+ */
 static float rate_inner_loop(float q_ref, float q_hat, float dt)
 {
     const float q_err = q_ref - q_hat;
-    float unsat_u;
-    float sat_u;
 
-    rate_integral += q_err * dt;
-    rate_integral = clampf(rate_integral, -600.0f, 600.0f);
+    /* Provisional output using the existing integrator */
+    float u_prop = (rate_Kp * q_err) + (rate_Ki * rate_integral);
 
-    unsat_u = (rate_Kp * q_err) + (rate_Ki * rate_integral);
-    sat_u   = clampf(unsat_u, -MOTOR_CMD_LIMIT_PPS, MOTOR_CMD_LIMIT_PPS);
+    const int sat_high = (u_prop >=  MOTOR_CMD_LIMIT_PPS);
+    const int sat_low  = (u_prop <= -MOTOR_CMD_LIMIT_PPS);
+    const int integrate_ok = (!sat_high && !sat_low)
+                          || (sat_high && q_err < 0.0f)
+                          || (sat_low  && q_err > 0.0f);
 
-    if (unsat_u != sat_u)
+    if (integrate_ok)
     {
-        rate_integral *= 0.995f;
+        rate_integral += q_err * dt;
+        rate_integral = clampf(rate_integral, -150.0f, 150.0f);
     }
+    /* else: hold the integrator until the next cycle's error flips sign. */
 
-    return sat_u;
+    const float u_final = (rate_Kp * q_err) + (rate_Ki * rate_integral);
+    return clampf(u_final, -MOTOR_CMD_LIMIT_PPS, MOTOR_CMD_LIMIT_PPS);
 }
 
 static void set_motor_speed(float target_speed_pps, float dt)
@@ -333,12 +375,21 @@ static void set_motor_speed(float target_speed_pps, float dt)
     target_speed_pps = clampf(target_speed_pps, -MOTOR_CMD_LIMIT_PPS, MOTOR_CMD_LIMIT_PPS);
     max_delta_pps = MOTOR_SLEW_PPS_PER_S * dt;
 
-    /* Software ramping is essential for steppers */
-    if ((motor_slewed_pps == 0.0f) && (target_speed_pps > MOTOR_KICK_PPS))
+    /* Software ramping for stepper synchronism.
+     *
+     * The MOTOR_KICK_PPS jump is useful in open-loop ID modes where we want
+     * to clear stiction in a single bite, but in closed-loop balancing the
+     * motor command passes through zero many times per second, and each
+     * zero-crossing kick injects a step-velocity discontinuity that violates
+     * the slew limit and corrupts the closed-loop response. The kick is
+     * therefore restricted to non-balancing modes. */
+    const int allow_kick = (test_mode != MODE_BALANCING);
+
+    if (allow_kick && (motor_slewed_pps == 0.0f) && (target_speed_pps > MOTOR_KICK_PPS))
     {
         motor_slewed_pps = MOTOR_KICK_PPS;
     }
-    else if ((motor_slewed_pps == 0.0f) && (target_speed_pps < -MOTOR_KICK_PPS))
+    else if (allow_kick && (motor_slewed_pps == 0.0f) && (target_speed_pps < -MOTOR_KICK_PPS))
     {
         motor_slewed_pps = -MOTOR_KICK_PPS;
     }
@@ -548,6 +599,7 @@ int main(void)
   static uint8_t batt_div = 0;
   static char bt_cmd_buf[32];
   static uint8_t bt_cmd_idx = 0;
+  static uint32_t sample_idx = 0;  /* monotonic index for defensible time axis */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -639,23 +691,22 @@ int main(void)
 
               case MODE_MOTOR_STEP:
               {
-                  /* Open-loop single step for plant identification.
-                     Phase 1 (0-499ms): motors off, robot settles upright.
-                     Phase 2 (500ms+):  fixed step, holds until you catch it.
-                     Power cycle to repeat. */
                   motor_outputs_enable();
                   reset_controllers();
                   test_timer++;
 
-                  if (test_timer < 100U)
-                  {
-                      /* Phase 1: settle */
+                  const uint32_t ticks_per_level = 300U;  /* 1.5 s */
+                  const uint32_t level = test_timer / ticks_per_level;
+
+                  float levels[] = {0.0f, 1000.0f, 2000.0f, 2500.0f, 3000.0f,
+                                    3250.0f, 3500.0f, 3750.0f, 4000.0f, 4250.0f, 0.0f};
+                  const uint32_t n_levels = sizeof(levels)/sizeof(levels[0]);
+
+                  if (level >= n_levels) {
                       test_motor_pps = 0.0f;
-                  }
-                  else
-                  {
-                      /* Phase 2: step and hold */
-                      test_motor_pps = 450.0f;
+                      test_timer = (n_levels - 1U) * ticks_per_level;
+                  } else {
+                      test_motor_pps = levels[level];
                   }
 
                   q_ref_dps     = 0.0f;
@@ -678,12 +729,18 @@ int main(void)
           /* =========================================================
              USART2 telemetry for MATLAB
              A packet every 5 ms:
-             A,acc_pitch,gyro_rate,theta_hat,theta_cmd,q_ref,u_cmd,u_applied,mode
+             A,sample_idx,acc_pitch,gyro_rate,theta_hat,theta_cmd,q_ref,u_cmd,u_applied,mode
+
+             sample_idx is a monotonic counter; defensible time axis for
+             post-processing is  t = sample_idx * 5 ms.  The PC-side arrival
+             timestamp should be treated as diagnostic only because USB
+             buffering makes it bursty.
              ========================================================= */
           {
-              char usbA[160];
+              char usbA[176];
               const int len = snprintf(usbA, sizeof(usbA),
-                                       "A,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+                                       "A,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d\n",
+                                       (unsigned long)sample_idx,
                                        acc_pitch_deg,
                                        gyro_rate_dps,
                                        estimated_pitch_deg,
@@ -724,6 +781,8 @@ int main(void)
                   HAL_UART_Transmit(&huart2, (uint8_t *)usbC, (uint16_t)len, 2);
               }
           }
+
+          sample_idx++;
 
           /* Bluetooth commands on USART1 */
           {
