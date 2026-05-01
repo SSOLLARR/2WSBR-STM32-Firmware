@@ -3,36 +3,13 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : Hybrid cascade-control starting point
-  *                   - keeps the clean dissertation-friendly structure
-  *                   - keeps the useful parts of the Gemini draft
+  *
   *
   * Control structure:
   *   Outer loop : pitch angle theta_hat  -> q_ref
   *   Inner loop : pitch rate  gyro_rate  -> motor pulse rate (PPS)
   *
-  * Notes:
-  *   1) This is NOT a true wheel-velocity inner loop, because the current robot
-  *      has IMU feedback and STEP/DIR stepper actuation but no measured wheel
-  *      speed feedback.
-  *   2) The pseudo-velocity supervisor from the Gemini draft has deliberately
-  *      been removed, because it used filtered control effort as if it were a
-  *      plant measurement. That is bad for black-box identification.
-  *   3) An optional Gemini-style nonlinear outer-loop gain punch is retained,
-  *      but set conservatively so it can be turned on later if needed.
   *
-  *   Revision (tuning pass):
-  *   - rate_Kp lowered 37 -> 18 so inner-loop P-term no longer saturates
-  *     the motor command at only ~68 dps of rate error.
-  *   - Both PI loops use proper conditional integration (Gleick-style
-  *     anti-windup): integrator only advances when doing so would not drive
-  *     further into saturation.
-  *   - rate_integral clamp tightened 600 -> 150 so the I-term alone can
-  *     never exceed the motor command limit.
-  *   - MOTOR_KICK_PPS jump is suppressed in MODE_BALANCING. The discontinuity
-  *     is useful for open-loop stepper ID but corrupts closed-loop response
-  *     every time motor_slewed_pps passes through zero.
-  *   - Packet A now carries a monotonic sample_idx. Time axis for post-
-  *     processing is sample_idx * 5 ms, independent of PC-side buffering.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -119,7 +96,7 @@ static float gyro_bias_x_dps = 0.0f;
 static float pitch_zero_deg  = 0.0f;
 
 /* Outer loop: theta -> q_ref */
-float angle_Kp         = 10.0f;
+float angle_Kp         = 7.023f;
 float angle_Ki         = 2.00f;
 float angle_aggression = 5.00f;
 float angle_integral   = 0.0f;
@@ -127,17 +104,13 @@ float theta_ref_deg    = THETA_REF_DEFAULT_DEG;
 float theta_trim_deg   = THETA_TRIM_DEFAULT_DEG;
 float q_ref_dps        = 0.0f;
 
-/* Inner loop: q -> motor PPS
- * rate_Kp reduced from 37 to 18. At 37, a gyro error of only ~68 dps saturated
- * motor_cmd at 2500 pps via the P-term alone, which meant the outer loop could
- * never command large q_ref without the inner loop instantly railing. */
-float rate_Kp       = 18.0f;
+/* Inner loop: q -> motor PPS — Run 2 retest, Grid #2, Q=diag(100,1) */
+float rate_Kp       = 37.010f;
 float rate_Ki       = 15.0f;
 float rate_integral = 0.0f;
-float motor_cmd_pps = 0.0f;  /* controller output before actuator shaping */
-float motor_applied_pps = 0.0f; /* actual post-limit / post-slew plant input */
+float motor_cmd_pps = 0.0f;
+float motor_applied_pps = 0.0f;
 static float motor_slewed_pps = 0.0f;
-
 /* Mode and test signals */
 int test_mode = MODE_BALANCING;
 uint32_t test_timer = 0;
